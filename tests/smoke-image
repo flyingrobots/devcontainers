@@ -46,6 +46,7 @@ run_in() {
 [[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
 docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^RUSTUP_TOOLCHAIN=' && fail "image sets RUSTUP_TOOLCHAIN"
 
+# shellcheck disable=SC2016  # \${CARGO_HOME} must expand inside the container, not on the host.
 run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"'
 echo "$output"
 v="${version//./\\.}"
