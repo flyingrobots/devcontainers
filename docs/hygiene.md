@@ -105,6 +105,7 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 | Resource | Name | Role label |
 | --- | --- | --- |
 | Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` |
+| Upstream base, the build input | `rust@sha256:<digest>` from `images/rust-dev/base-digests`, pulled by digest. It carries only upstream labels. Keep it while its digest line exists; after removing the line, remove it with `docker image rm`. | none (upstream image) |
 | Run container | `<project>-dev-run` (one at a time, under a lock) | `dev-run` |
 | Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` |
 | Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` |
