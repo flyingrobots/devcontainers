@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Build flyingrobots/rust-dev:<rust-version> from the digest pinned in images/rust-dev/base-digests.
+# Runs under the workstation git-locks keys for this repository's Docker worker.
+set -euo pipefail
+version="${1:?usage: scripts/build-image <rust-version>}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+base="$(awk -v v="$version" '$1 == v { print $2 }' "$root/images/rust-dev/base-digests")"
+if [[ -z "$base" ]]; then
+  echo "build-image: no pinned digest for Rust $version in images/rust-dev/base-digests" >&2
+  exit 2
+fi
+tag="flyingrobots/rust-dev:$version"
+build=(docker build
+  --file "$root/images/rust-dev/Dockerfile"
+  --build-arg "BASE_IMAGE=$base"
+  --build-arg "RUST_VERSION=$version"
+  --label "org.flyingrobots.base-digest=$base"
+  --tag "$tag"
+  "$root/images/rust-dev")
+# CI runners are single-use machines with no shared git-locks store.
+if [[ "${CI:-}" == "true" ]]; then
+  exec "${build[@]}"
+fi
+store="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}"
+exec env GIT_LOCKS_STORE="$store" git locks with \
+  --job "devcontainers-build-$(uuidgen)" --holder "${USER:-agent}-build-image" \
+  --ttl 2400 --wait 600 --note "build $tag" \
+  host/heavy-work host/docker/devcontainers-dev/ -- \
+  perl -e 'alarm 1800; exec @ARGV' "${build[@]}"

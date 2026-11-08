@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Smoke test for flyingrobots/rust-dev:<rust-version>. Runs one locked-down, labeled, offline container.
+set -euo pipefail
+version="${1:?usage: tests/smoke-image <rust-version>}"
+image="flyingrobots/rust-dev:$version"
+fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
+
+[[ "$(docker image inspect "$image" --format '{{json .Config.Volumes}}')" == "null" ]] || fail "image declares VOLUME"
+[[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.owner"}}')" == "devcontainers" ]] || fail "owner label missing"
+[[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.role"}}')" == "base-image" ]] || fail "role label missing"
+[[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
+
+out="$(docker run --rm --name devcontainers-smoke-run \
+  --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
+  --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+  "$image" sh -c 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; git --version')"
+echo "$out"
+grep -q "^rustc $version " <<<"$out" || fail "rustc is not $version"
+grep -q '^clippy ' <<<"$out" || fail "clippy missing"
+grep -q '^rustfmt ' <<<"$out" || fail "rustfmt missing"
+grep -q '^wasm32-unknown-unknown$' <<<"$out" || fail "wasm32 target missing"
+grep -q '^cargo-deny 0.20.2$' <<<"$out" || fail "cargo-deny 0.20.2 missing"
+grep -qx '10001' <<<"$out" || fail "container does not run as uid 10001"
+docker ps -a --filter name=^devcontainers-smoke-run$ --format '{{.Names}}' | grep -q . && fail "smoke container was not removed"
+echo "smoke-image: PASS ($image)"
