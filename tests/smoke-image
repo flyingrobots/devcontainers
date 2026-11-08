@@ -10,7 +10,7 @@ name=devcontainers-dev-run
 if [[ "${GITHUB_ACTIONS:-}" != "true" && -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
   exec env GIT_LOCKS_STORE="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}" DEVCONTAINERS_LOCK_HELD=1 \
     git locks with --job "devcontainers-smoke-$(uuidgen)" --holder "${USER:-agent}-smoke-image" \
-    --ttl 900 --wait 600 --note "smoke $image" host/heavy-work host/docker/devcontainers-dev/ -- "$0" "$@"
+    --ttl 900 --wait 600 --note "smoke $image" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
 fi
 
 fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
@@ -20,7 +20,7 @@ leftover_check() {
   # Remove only a container this run created; a pre-existing leftover stays for inspection.
   if (( created )); then
     docker rm -f "$name" >/dev/null 2>&1 || true
-    if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+    if [[ -n "$(docker ps -a -q --filter "name=^${name}\$")" ]]; then
       echo "smoke-image: FAIL: $name still exists" >&2
       exit 1
     fi
@@ -35,9 +35,9 @@ trap leftover_check EXIT
 # The name is fixed on purpose (docs/hygiene.md section 5): a leftover from an interrupted run is a
 # conflict that this test reports, not litter that a fresh random name would hide.
 run_in() {
-  if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
-    fail "leftover container $name exists (interrupted run?); inspect it, then: docker rm -f $name"
-  fi
+  local leftover
+  leftover="$(docker ps -a -q --filter "name=^${name}\$")" || fail "could not list containers"
+  [[ -z "$leftover" ]] || fail "leftover container $name exists (interrupted run?); inspect it, then: docker rm -f $name"
   docker create --name "$name" \
     --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
     --user 10001:10001 --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
@@ -54,15 +54,17 @@ run_in() {
   return "$rc"
 }
 
+docker image inspect "$image" >/dev/null 2>&1 || fail "image $image not found; build it with scripts/build-image $version"
 [[ "$(docker image inspect "$image" --format '{{json .Config.Volumes}}')" == "null" ]] || fail "image declares VOLUME"
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.owner"}}')" == "devcontainers" ]] || fail "owner label missing"
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.role"}}')" == "base-image" ]] || fail "role label missing"
 [[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
 [[ "$(docker image inspect "$image" --format '{{.Config.WorkingDir}}')" == "/work" ]] || fail "working directory is not /work"
-docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^RUSTUP_TOOLCHAIN=' && fail "image sets RUSTUP_TOOLCHAIN"
+env_list="$(docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+if grep -q '^RUSTUP_TOOLCHAIN=' <<<"$env_list"; then fail "image sets RUSTUP_TOOLCHAIN"; fi
 
 # shellcheck disable=SC2016  # \${CARGO_HOME} must expand inside the container, not on the host.
-run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"; echo "work=$(stat -c %u:%g /work)"'
+run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"; for d in /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git; do echo "owner $d $(stat -c %u:%g "$d")"; done'
 echo "$output"
 v="${version//./\\.}"
 grep -q "^rustc $v " <<<"$output" || fail "rustc is not $version"
@@ -73,7 +75,9 @@ grep -q '^wasm32-unknown-unknown$' <<<"$output" || fail "wasm32 target missing"
 grep -q '^cargo-deny 0\.20\.2$' <<<"$output" || fail "cargo-deny 0.20.2 missing"
 grep -qx '10001' <<<"$output" || fail "container does not run as uid 10001"
 grep -qx 'CARGO_HOME=/usr/local/cargo' <<<"$output" || fail "CARGO_HOME is not the read-only image path"
-grep -qx 'work=10001:10001' <<<"$output" || fail "/work is not owned by 10001"
+for d in /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git; do
+  grep -qx "owner $d 10001:10001" <<<"$output" || fail "$d is not owned by 10001 (a new named volume copies this ownership)"
+done
 
 # A repository that pins another toolchain must fail, not build with this compiler. The marker shows
 # the container reached the check; the error must be rustup failing to install on the read-only root.

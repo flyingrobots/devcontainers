@@ -56,9 +56,10 @@ RUN groupadd --gid 10001 dev \
 
 # HOME is /tmp/home. The image creates it; a run that mounts a fresh tmpfs on /tmp must create it
 # again (devrun and tests/smoke-image do).
-# No RUSTUP_TOOLCHAIN: a repository's rust-toolchain.toml must match this image. Otherwise rustup
-# tries to install the other toolchain, which fails on the read-only root, instead of silently
-# building with this compiler. CARGO_INCREMENTAL=0 keeps audit
+# No RUSTUP_TOOLCHAIN: a repository's rust-toolchain.toml channel must match this image. Otherwise
+# rustup tries to install the other toolchain, which fails on the read-only root. This catches an
+# honest mismatch only: a repository can still run its own compiler (a path toolchain, build.rustc).
+# docs/hygiene.md section 2. CARGO_INCREMENTAL=0 keeps audit
 # builds free of incremental state. GIT_CONFIG_NOSYSTEM=1 ignores any system git config.
 ENV CARGO_TARGET_DIR=/target \
     CARGO_INCREMENTAL=0 \

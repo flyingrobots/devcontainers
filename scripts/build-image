@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build flyingrobots/rust-dev:<rust-version> from the digest pinned in images/rust-dev/base-digests.
-# On the workstation it runs under the git-locks keys host/heavy-work and host/docker/devcontainers-dev/
+# On the workstation it runs under the git-locks keys host/heavy-work and host/docker/devcontainers-dev-run/
 # (docs/hygiene.md section 10), with a 30-minute timeout inside a 40-minute lease (section 7), and it
 # refuses to start below 50 GiB free on the host or in the Docker VM (section 8). Time budget inside
 # the lease: base pull 300 s + free-space check 60 s + build 1800 s = 2160 s, below the 2400 s lease.
@@ -42,7 +42,7 @@ if [[ -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
   # Default store: the shared workstation store on this macOS machine.
   exec env GIT_LOCKS_STORE="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}" DEVCONTAINERS_LOCK_HELD=1 \
     git locks with --job "devcontainers-build-$(uuidgen)" --holder "${USER:-agent}-build-image" \
-    --ttl 2400 --wait 600 --note "build $tag" host/heavy-work host/docker/devcontainers-dev/ -- "$0" "$@"
+    --ttl 2400 --wait 600 --note "build $tag" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
 fi
 
 # perl's alarm is the timeout, because macOS has no coreutils timeout by default.
@@ -55,17 +55,23 @@ fi
 min_kib=$((50 * 1024 * 1024))
 host_free="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
 run_name=devcontainers-dev-run
-# A leftover from an interrupted run stays for inspection; this script never removes it.
-if docker ps -a --format '{{.Names}}' | grep -qx "$run_name"; then
+run_id="build-$(uuidgen)"
+# A leftover from an interrupted run stays for inspection; this script never removes it. A failed
+# listing stops the script (set -e), so an error never reads as "no leftover".
+leftover="$(docker ps -a -q --filter "name=^${run_name}\$")"
+if [[ -n "$leftover" ]]; then
   echo "build-image: leftover container $run_name exists (interrupted run?); inspect it, then: docker rm -f $run_name" >&2
   exit 3
 fi
-# The alarm stops only the docker client, so on failure remove the container this script started.
+# The alarm stops only the docker client, so on failure remove the container this run started. It
+# carries this run's own label, so a container that someone else created under the name stays.
 vm_out="$(alarm 60 docker run --rm --pull never --name "$run_name" --network none \
   --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
+  --label "org.flyingrobots.run=$run_id" \
   --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 "${limits[@]}" \
   --entrypoint df "$base" -Pk /)" || {
-  docker rm -f "$run_name" >/dev/null 2>&1 || true
+  mine="$(docker ps -a -q --filter "label=org.flyingrobots.run=$run_id" || true)"
+  [[ -z "$mine" ]] || docker rm -f "$mine" >/dev/null 2>&1 || true
   echo "build-image: could not measure Docker VM free space (failed or timed out)" >&2
   exit 3
 }

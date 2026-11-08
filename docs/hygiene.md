@@ -47,8 +47,9 @@ image build and a smoke test.
 - Non-root user with a fixed UID (`10001`), `--user 10001:10001`.
 - `--cap-drop ALL`, `--security-opt no-new-privileges`.
 - `--read-only` root filesystem. Writable places: `/work` (the copy, at the
-  root of the work volume), `/scratch`, `/tmp` (tmpfs with a size limit), and
-  the other named volumes in section 5.
+  root of the work volume), `/scratch`, `/tmp` (tmpfs with a size limit), the
+  other named volumes in section 5, and Docker's own `/dev/shm` and
+  `/dev/mqueue`.
 - **No writable directory above the copy.** Cargo reads `.cargo/config.toml` in
   the working directory and in every parent directory. The copy is the root of
   its own volume, so its only parent is the read-only root. Before each copy-in,
@@ -60,8 +61,12 @@ image build and a smoke test.
   world-writable. Under `--read-only`, a run cannot plant a cargo `config.toml`
   or a `credentials.toml` there.
 - No `RUSTUP_TOOLCHAIN` in the image or the run: a repository's
-  `rust-toolchain.toml` must match the image. Otherwise rustup tries to install
-  the other toolchain, and that fails on the read-only root.
+  `rust-toolchain.toml` channel must match the image. Otherwise rustup tries to
+  install the other toolchain, and that fails on the read-only root. This
+  catches an honest version mismatch only. A hostile repository can still run
+  its own compiler, for example through a `path` toolchain or `build.rustc` in
+  its own `.cargo/config.toml`, so a run's output never proves which compiler
+  built it. The isolation rules contain such a compiler like any other code.
 - Limits on every run: `--pids-limit`, `--memory` with `--memory-swap` equal to
   it, `--cpus`, `--ulimit nofile`.
 - Never `--privileged`, `--network host`, `--pid host`, `--ipc host`, or added
@@ -151,8 +156,10 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 
 ## 10. Locks
 
-- Each run claims `host/heavy-work` and `host/docker/<project>-dev/` in the
-  workstation `git-locks` store, with a lease longer than the timeout.
+- Each run claims `host/heavy-work` and `host/docker/<project>-dev-run/` in the
+  workstation `git-locks` store, with a lease longer than the timeout. The
+  second key follows the workstation registry rule
+  `host/docker/<exact-container-name>/`.
 
 ## 11. Not ours
 
