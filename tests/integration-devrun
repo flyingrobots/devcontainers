@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Real-Docker integration test for bin/devrun. Needs flyingrobots/rust-dev:1.96.0 (scripts/build-image 1.96.0).
+# Uses project name devrun-selftest and removes only that project's labeled volumes at the end.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+devrun="$root/bin/devrun"
+project=devrun-selftest
+work="$(mktemp -d -t devrun-selftest-XXXXXX)"
+fail() { echo "integration-devrun: FAIL: $*" >&2; exit 1; }
+cleanup() {
+  rm -rf "$work"
+  docker rm -f "$project-dev-run" >/dev/null 2>&1 || true
+  for v in cargo-registry cargo-git target target-evidence scratch; do
+    if [[ "$(docker volume inspect "$project-$v" --format '{{index .Labels "org.flyingrobots.owner"}}' 2>/dev/null || true)" == "$project" ]]; then
+      docker volume rm "$project-$v" >/dev/null
+    fi
+  done
+}
+trap cleanup EXIT
+
+repo="$work/repo"; mkdir -p "$repo/src"
+git -C "$repo" init -q -b main
+printf 'hello\n' > "$repo/README"
+printf 'fn main() {}\n' > "$repo/src/main.rs"
+ln -s README "$repo/README.link"
+git -C "$repo" add -A
+git -C "$repo" -c user.name=t -c user.email=t@invalid commit -q -m "base: first"
+base="$(git -C "$repo" rev-parse HEAD)"
+printf 'second\n' >> "$repo/README"
+git -C "$repo" -c user.name=t -c user.email=t@invalid commit -qam "feat: second
+
+Repo-Respect-Receipt: none"
+head="$(git -C "$repo" rev-parse HEAD)"
+
+echo "== commit mode: isolation checks"
+probe='set -e
+test "$(id -u)" = 10001
+test -f README && test -L README.link && test "$(cat README.link | head -1)" = hello
+test -d .git  # created inside the container by devrun, empty baseline only
+test "$(git log --format=%s)" = "devrun baseline"
+if touch /usr/local/devrun-probe 2>/dev/null; then echo "root fs is writable" >&2; exit 11; fi
+if curl -sS -m 5 https://example.com >/dev/null 2>&1; then echo "network reachable" >&2; exit 12; fi
+if test -e /var/run/docker.sock; then echo "docker socket visible" >&2; exit 13; fi
+grep -q "^CapEff:\s*0000000000000000" /proc/self/status || { echo "capabilities not dropped" >&2; exit 14; }
+grep -q "^NoNewPrivs:\s*1" /proc/self/status || { echo "no_new_privs not set" >&2; exit 15; }
+if touch /usr/local/cargo/registry/devrun-probe 2>/dev/null; then echo "cargo registry writable in the run phase" >&2; exit 16; fi
+if touch /usr/local/cargo/config.toml 2>/dev/null; then echo "CARGO_HOME writable" >&2; exit 17; fi
+echo ok > /scratch/out/result.txt
+printf "changed\n" >> README'
+out1="$work/out1"
+"$devrun" "$project" "$repo" --commit "$head" --timeout 300 --export result.txt --export-patch --out "$out1" -- bash -c "$probe"
+[[ "$(cat "$out1/result.txt")" == "ok" ]] || fail "export result.txt"
+grep -q '^+changed$' "$out1/changes.patch" || fail "patch does not contain the change"
+docker ps -a --format '{{.Names}}' | grep -qx "$project-dev-run" && fail "container still exists"
+
+echo "== worktree mode: untracked file included, ignored file excluded"
+printf 'new\n' > "$repo/untracked.txt"
+printf 'secret\n' > "$repo/ignored.env"; printf 'ignored.env\n' > "$repo/.gitignore"
+out2="$work/out2"
+"$devrun" "$project" "$repo" --worktree --timeout 300 --export result.txt --out "$out2" -- \
+  bash -c 'test -f untracked.txt && ! test -e ignored.env && echo ok > /scratch/out/result.txt'
+[[ "$(cat "$out2/result.txt")" == "ok" ]] || fail "worktree mode"
+
+echo "== history mode: real commits, exact HEAD, origin/main at base"
+out3="$work/out3"
+"$devrun" "$project" "$repo" --history "$base..$head" --timeout 300 --export result.txt --out "$out3" -- \
+  bash -c "test \"\$(git rev-parse HEAD)\" = $head && test \"\$(git rev-parse origin/main)\" = $base && git log -1 --format=%B | grep -q 'Repo-Respect-Receipt: none' && echo ok > /scratch/out/result.txt"
+[[ "$(cat "$out3/result.txt")" == "ok" ]] || fail "history mode"
+
+echo "== refusals"
+ln -s /etc/passwd "$repo/evil"; git -C "$repo" add evil; git -C "$repo" -c user.name=t -c user.email=t@invalid commit -qm "evil"
+if "$devrun" "$project" "$repo" --commit HEAD --timeout 60 -- true 2>"$work/err"; then fail "absolute symlink accepted"; fi
+grep -q 'absolute symlink' "$work/err" || fail "wrong refusal: $(cat "$work/err")"
+
+echo "integration-devrun: PASS"
