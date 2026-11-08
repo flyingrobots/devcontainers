@@ -2,7 +2,8 @@
 # Build flyingrobots/rust-dev:<rust-version> from the digest pinned in images/rust-dev/base-digests.
 # On the workstation it runs under the git-locks keys host/heavy-work and host/docker/devcontainers-dev/
 # (docs/hygiene.md section 10), with a 30-minute timeout inside a 40-minute lease (section 7), and it
-# refuses to start below 50 GiB free on the host or in the Docker VM (section 8).
+# refuses to start below 50 GiB free on the host or in the Docker VM (section 8). Time budget inside
+# the lease: base pull 300 s + free-space check 60 s + build 1800 s = 2160 s, below the 2400 s lease.
 set -euo pipefail
 version="${1:?usage: scripts/build-image <rust-version>}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,6 +24,14 @@ build=(docker build
   --tag "$tag"
   "$root/images/rust-dev")
 timeout_s=1800
+limits=(--pids-limit 32 --memory 128m --memory-swap 128m --cpus 0.5 --ulimit nofile=256:256)
+
+# Only a docker-driver builder loads the result into the local image store under its tag (section 4).
+driver="$(docker buildx inspect | awk '$1 == "Driver:" { print $2; exit }')"
+if [[ "$driver" != "docker" ]]; then
+  echo "build-image: the selected buildx builder uses driver '${driver:-unknown}'; select a docker-driver builder first" >&2
+  exit 4
+fi
 
 # GitHub Actions runners are single-use machines with no shared git-locks store. Keep the timeout.
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
@@ -36,16 +45,35 @@ if [[ -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
     --ttl 2400 --wait 600 --note "build $tag" host/heavy-work host/docker/devcontainers-dev/ -- "$0" "$@"
 fi
 
+# perl's alarm is the timeout, because macOS has no coreutils timeout by default.
+alarm() { local s="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+
+if ! docker image inspect "$base" >/dev/null 2>&1; then
+  echo "build-image: pulling $base" >&2
+  alarm 300 docker pull --quiet "$base" >/dev/null
+fi
 min_kib=$((50 * 1024 * 1024))
 host_free="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
-vm_free="$(docker run --rm --name devcontainers-dev-run --network none \
+run_name=devcontainers-dev-run
+# A leftover from an interrupted run stays for inspection; this script never removes it.
+if docker ps -a --format '{{.Names}}' | grep -qx "$run_name"; then
+  echo "build-image: leftover container $run_name exists (interrupted run?); inspect it, then: docker rm -f $run_name" >&2
+  exit 3
+fi
+# The alarm stops only the docker client, so on failure remove the container this script started.
+vm_out="$(alarm 60 docker run --rm --pull never --name "$run_name" --network none \
   --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
-  --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
-  --entrypoint df "$base" -Pk / | awk 'NR == 2 { print $4 }')"
+  --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 "${limits[@]}" \
+  --entrypoint df "$base" -Pk /)" || {
+  docker rm -f "$run_name" >/dev/null 2>&1 || true
+  echo "build-image: could not measure Docker VM free space (failed or timed out)" >&2
+  exit 3
+}
+vm_free="$(awk 'NR == 2 { print $4 }' <<<"$vm_out")"
+[[ "$vm_free" =~ ^[0-9]+$ ]] || { echo "build-image: unexpected df output: $vm_out" >&2; exit 3; }
 if (( host_free < min_kib || vm_free < min_kib )); then
   echo "build-image: refusing to start: less than 50 GiB free (host ${host_free} KiB, Docker VM ${vm_free} KiB)" >&2
   exit 3
 fi
 
-# perl's alarm is the timeout, because macOS has no coreutils timeout by default.
 exec perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${build[@]}"

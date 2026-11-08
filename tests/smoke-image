@@ -29,7 +29,9 @@ leftover_check() {
 }
 trap leftover_check EXIT
 
-# run_in SCRIPT: create, start, and remove one container; print its output.
+# run_in SCRIPT: create, start, and remove one container; put its stdout in $output and return the
+# container's exit status. A setup failure (create, timeout, or remove) stops the test: it is never
+# counted as an expected failure.
 # The name is fixed on purpose (docs/hygiene.md section 5): a leftover from an interrupted run is a
 # conflict that this test reports, not litter that a fresh random name would hide.
 run_in() {
@@ -42,11 +44,12 @@ run_in() {
     --cap-drop ALL --security-opt no-new-privileges \
     --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1024:1024 \
     --env CARGO_NET_OFFLINE=true \
-    "$image" bash -c 'mkdir -p "$HOME" && eval "$1"' smoke "$1" >/dev/null
+    "$image" bash -c 'mkdir -p "$HOME" && eval "$1"' smoke "$1" >/dev/null || fail "docker create failed"
   created=1
   local rc=0
   output="$(perl -e 'alarm 120; exec @ARGV' docker start -a "$name")" || rc=$?
-  docker rm -f "$name" >/dev/null
+  (( rc != 142 )) || fail "container timed out after 120 s"
+  docker rm -f "$name" >/dev/null || fail "could not remove $name"
   created=0
   return "$rc"
 }
@@ -55,10 +58,11 @@ run_in() {
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.owner"}}')" == "devcontainers" ]] || fail "owner label missing"
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.role"}}')" == "base-image" ]] || fail "role label missing"
 [[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
+[[ "$(docker image inspect "$image" --format '{{.Config.WorkingDir}}')" == "/work" ]] || fail "working directory is not /work"
 docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^RUSTUP_TOOLCHAIN=' && fail "image sets RUSTUP_TOOLCHAIN"
 
 # shellcheck disable=SC2016  # \${CARGO_HOME} must expand inside the container, not on the host.
-run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"'
+run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"; echo "work=$(stat -c %u:%g /work)"'
 echo "$output"
 v="${version//./\\.}"
 grep -q "^rustc $v " <<<"$output" || fail "rustc is not $version"
@@ -69,19 +73,26 @@ grep -q '^wasm32-unknown-unknown$' <<<"$output" || fail "wasm32 target missing"
 grep -q '^cargo-deny 0\.20\.2$' <<<"$output" || fail "cargo-deny 0.20.2 missing"
 grep -qx '10001' <<<"$output" || fail "container does not run as uid 10001"
 grep -qx 'CARGO_HOME=/usr/local/cargo' <<<"$output" || fail "CARGO_HOME is not the read-only image path"
+grep -qx 'work=10001:10001' <<<"$output" || fail "/work is not owned by 10001"
 
-# A repository that pins another toolchain must fail offline, not build with this compiler.
-if run_in 'mkdir -p /tmp/p && cd /tmp/p && printf "[toolchain]\nchannel = \"1.80.0\"\n" > rust-toolchain.toml && rustc --version'; then
+# A repository that pins another toolchain must fail, not build with this compiler. The marker shows
+# the container reached the check; the error must be rustup failing to install on the read-only root.
+if run_in 'mkdir -p /tmp/p && cd /tmp/p && printf "[toolchain]\nchannel = \"1.80.0\"\n" > rust-toolchain.toml && echo reached && rustc --version 2>&1'; then
   fail "a mismatched rust-toolchain.toml did not fail"
 fi
-echo "smoke-image: mismatched rust-toolchain.toml fails offline (expected)"
+grep -qx reached <<<"$output" || fail "mismatched-toolchain check did not run"
+grep -q 'Read-only file system' <<<"$output" || fail "mismatched toolchain failed for another reason: $output"
+echo "smoke-image: mismatched rust-toolchain.toml fails on the read-only root (expected)"
 
 # HOME is writable after the run creates it on the tmpfs.
+# shellcheck disable=SC2016  # $(git config ...) must expand inside the container, not on the host.
 run_in 'git config --global user.name smoke && test "$(git config --global user.name)" = smoke' || fail "HOME is not writable"
 echo "smoke-image: HOME is writable (expected)"
 
-# The image path for CARGO_HOME is read-only at run time.
-if run_in 'touch /usr/local/cargo/config.toml'; then fail "CARGO_HOME is writable"; fi
-echo "smoke-image: CARGO_HOME is read-only (expected)"
+# Under --read-only, the image path for CARGO_HOME cannot take a planted config.
+if run_in 'echo reached && touch /usr/local/cargo/config.toml 2>&1'; then fail "CARGO_HOME is writable"; fi
+grep -qx reached <<<"$output" || fail "CARGO_HOME check did not run"
+grep -q 'Read-only file system' <<<"$output" || fail "CARGO_HOME check failed for another reason: $output"
+echo "smoke-image: CARGO_HOME is read-only under --read-only (expected)"
 
 echo "smoke-image: PASS ($image)"

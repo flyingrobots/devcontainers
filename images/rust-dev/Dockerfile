@@ -44,18 +44,21 @@ RUN set -eu; \
 
 # Unprivileged user (fixed UID per docs/hygiene.md section 2) and the mount points for the named
 # volumes (section 5). New named volumes copy the ownership of these directories, so UID 10001 can
-# write to them. CARGO_HOME stays at the image path /usr/local/cargo: containers run with a
-# read-only root, so no run can plant a cargo config there. Only its registry and git caches are
-# volumes.
+# write to them. The copy lives at /work, the root of its own volume: its only parent directory is
+# the root filesystem, so no writable directory above the copy can hold a .cargo/config.toml that
+# cargo would read. CARGO_HOME stays at the image path /usr/local/cargo, with only its registry and
+# git caches as volumes. CARGO_HOME and the toolchain are read-only only because every run uses
+# --read-only: the base image leaves those directories world-writable.
 RUN groupadd --gid 10001 dev \
  && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/home --shell /usr/sbin/nologin dev \
- && mkdir -p /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home \
- && chown 10001:10001 /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home
+ && mkdir -p /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home \
+ && chown 10001:10001 /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home
 
 # HOME is /tmp/home. The image creates it; a run that mounts a fresh tmpfs on /tmp must create it
 # again (devrun and tests/smoke-image do).
-# No RUSTUP_TOOLCHAIN: a repository's rust-toolchain.toml must match this image, or the run fails
-# offline instead of silently building with another compiler. CARGO_INCREMENTAL=0 keeps audit
+# No RUSTUP_TOOLCHAIN: a repository's rust-toolchain.toml must match this image. Otherwise rustup
+# tries to install the other toolchain, which fails on the read-only root, instead of silently
+# building with this compiler. CARGO_INCREMENTAL=0 keeps audit
 # builds free of incremental state. GIT_CONFIG_NOSYSTEM=1 ignores any system git config.
 ENV CARGO_TARGET_DIR=/target \
     CARGO_INCREMENTAL=0 \
@@ -63,4 +66,4 @@ ENV CARGO_TARGET_DIR=/target \
     GIT_CONFIG_NOSYSTEM=1
 
 USER 10001:10001
-WORKDIR /scratch/work
+WORKDIR /work

@@ -5,6 +5,12 @@ is hostile. The host, its git repositories, its credentials, and other projects'
 Docker resources must stay unreachable and unchanged. The runner (`bin/devrun`)
 enforces every rule here; a rule that only lives in this file is not enforced.
 
+**Status:** `bin/devrun` is not merged yet (flyingrobots/devcontainers#3). Until
+it is, the rules about runs (copy-in, network phases, run-phase mounts, prep,
+outputs, audit) are its specification, and nothing enforces them.
+`scripts/build-image` and `tests/smoke-image` enforce the rules that apply to an
+image build and a smoke test.
+
 ## 1. Source isolation
 
 - **Copy in, never mount.** No host path is bind-mounted into a container: not
@@ -40,13 +46,22 @@ enforces every rule here; a rule that only lives in this file is not enforced.
 
 - Non-root user with a fixed UID (`10001`), `--user 10001:10001`.
 - `--cap-drop ALL`, `--security-opt no-new-privileges`.
-- `--read-only` root filesystem. Writable places: `/scratch/work` (the copy,
-  inside the scratch volume), `/tmp` (tmpfs with a size limit), and the named
-  volumes in section 5.
-- `CARGO_HOME` is the image path `/usr/local/cargo`, which is read-only at run
-  time, so no run can plant a cargo `config.toml` or a `credentials.toml`.
+- `--read-only` root filesystem. Writable places: `/work` (the copy, at the
+  root of the work volume), `/scratch`, `/tmp` (tmpfs with a size limit), and
+  the other named volumes in section 5.
+- **No writable directory above the copy.** Cargo reads `.cargo/config.toml` in
+  the working directory and in every parent directory. The copy is the root of
+  its own volume, so its only parent is the read-only root. Before each copy-in,
+  the runner empties the work and scratch volumes completely, hidden entries
+  included, so a `.cargo/config.toml` that one run leaves behind never reaches
+  the next.
+- `CARGO_HOME` is the image path `/usr/local/cargo`. It is read-only only
+  because the run uses `--read-only`: the base image leaves it and the toolchain
+  world-writable. Under `--read-only`, a run cannot plant a cargo `config.toml`
+  or a `credentials.toml` there.
 - No `RUSTUP_TOOLCHAIN` in the image or the run: a repository's
-  `rust-toolchain.toml` must match the image, or the run fails offline.
+  `rust-toolchain.toml` must match the image. Otherwise rustup tries to install
+  the other toolchain, and that fails on the read-only root.
 - Limits on every run: `--pids-limit`, `--memory` with `--memory-swap` equal to
   it, `--cpus`, `--ulimit nofile`.
 - Never `--privileged`, `--network host`, `--pid host`, `--ipc host`, or added
@@ -90,7 +105,8 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 | Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` |
 | Build output, iteration | `<project>-target` | `target` |
 | Build output, evidence | `<project>-target-evidence`, emptied before each merge-gate run | `target-evidence` |
-| Logs, test data, exports | `<project>-scratch` | `scratch` |
+| The copy, at `/work` | `<project>-work`, emptied before each copy-in | `work` |
+| Inputs, logs, test data, exports, at `/scratch` | `<project>-scratch`, emptied before each copy-in | `scratch` |
 
 - No anonymous volumes. Images must not declare `VOLUME`.
 - The cargo caches are writable only in the fetch phase. The build phase mounts
