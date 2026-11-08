@@ -76,8 +76,19 @@ image build and a smoke test.
 
 ## 3. Network
 
-- **Phase 1, fetch:** `cargo fetch --locked` with network access, writing only
-  to the project's registry volume.
+- **Phase 1, fetch:** `cargo fetch --locked` with network access and the cargo
+  caches writable. It must run no code that the repository chooses, because a
+  program that runs now can rewrite cached sources for every later run.
+  `cargo fetch` asks the compiler for target information, so a repository's
+  `build.rustc-wrapper`, `build.rustc`, or `path` toolchain would run here.
+  Therefore:
+  - The fetch copy contains no `.cargo/config` or `.cargo/config.toml` file
+    and no `rust-toolchain` or `rust-toolchain.toml` file.
+  - The fetch command runs with `RUSTUP_TOOLCHAIN` set to the image's version,
+    `RUSTC=/usr/local/cargo/bin/rustc`, and `RUSTC_WRAPPER` and
+    `RUSTC_WORKSPACE_WRAPPER` set empty. These override the same settings in
+    any configuration file.
+  - `cargo fetch` runs no build scripts and no procedural macros.
 - **Phase 2, build and test:** `--network none` and `CARGO_NET_OFFLINE=true`. A
   build script cannot download or send anything.
 - A command that truly needs the network in phase 2 must say so with
@@ -115,9 +126,9 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 | Inputs, logs, test data, exports, at `/scratch` | `<project>-scratch`, emptied before each copy-in | `scratch` |
 
 - No anonymous volumes. Images must not declare `VOLUME`.
-- The cargo caches are writable only in the fetch phase. The build phase mounts
-  them read-only, so a hostile build script cannot poison the cache for a later
-  run.
+- The cargo caches are writable only in the fetch phase, which runs no code
+  that the repository chooses (section 3). The build phase mounts them
+  read-only, so a hostile build script cannot poison the cache for a later run.
 - **Evidence runs use a fresh target.** A merge-gate run never reuses build
   output, so a stale cache cannot fabricate a passing result.
 

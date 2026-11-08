@@ -46,7 +46,8 @@ RUN set -eu; \
 # volumes (section 5). New named volumes copy the ownership of these directories, so UID 10001 can
 # write to them. The copy lives at /work, the root of its own volume: its only parent directory is
 # the root filesystem, so no writable directory above the copy can hold a .cargo/config.toml that
-# cargo would read. CARGO_HOME stays at the image path /usr/local/cargo, with only its registry and
+# cargo would read. The work volume itself persists, so the runner must empty it before each
+# copy-in (docs/hygiene.md section 2). CARGO_HOME stays at the image path /usr/local/cargo, with only its registry and
 # git caches as volumes. CARGO_HOME and the toolchain are read-only only because every run uses
 # --read-only: the base image leaves those directories world-writable.
 RUN groupadd --gid 10001 dev \
