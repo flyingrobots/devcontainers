@@ -49,9 +49,11 @@ RUN set -eu; \
 # volumes.
 RUN groupadd --gid 10001 dev \
  && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/home --shell /usr/sbin/nologin dev \
- && mkdir -p /scratch /target /usr/local/cargo/registry /usr/local/cargo/git \
- && chown 10001:10001 /scratch /target /usr/local/cargo/registry /usr/local/cargo/git
+ && mkdir -p /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home \
+ && chown 10001:10001 /scratch /target /usr/local/cargo/registry /usr/local/cargo/git /tmp/home
 
+# HOME is /tmp/home. The image creates it; a run that mounts a fresh tmpfs on /tmp must create it
+# again (devrun and tests/smoke-image do).
 # No RUSTUP_TOOLCHAIN: a repository's rust-toolchain.toml must match this image, or the run fails
 # offline instead of silently building with another compiler. CARGO_INCREMENTAL=0 keeps audit
 # builds free of incremental state. GIT_CONFIG_NOSYSTEM=1 ignores any system git config.

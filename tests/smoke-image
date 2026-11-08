@@ -14,29 +14,40 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" && -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; t
 fi
 
 fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
+created=0
 leftover_check() {
   status=$?
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
-    echo "smoke-image: FAIL: $name still exists" >&2
-    exit 1
+  # Remove only a container this run created; a pre-existing leftover stays for inspection.
+  if (( created )); then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+      echo "smoke-image: FAIL: $name still exists" >&2
+      exit 1
+    fi
   fi
   exit "$status"
 }
 trap leftover_check EXIT
 
 # run_in SCRIPT: create, start, and remove one container; print its output.
+# The name is fixed on purpose (docs/hygiene.md section 5): a leftover from an interrupted run is a
+# conflict that this test reports, not litter that a fresh random name would hide.
 run_in() {
+  if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+    fail "leftover container $name exists (interrupted run?); inspect it, then: docker rm -f $name"
+  fi
   docker create --name "$name" \
     --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
     --user 10001:10001 --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges \
     --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1024:1024 \
     --env CARGO_NET_OFFLINE=true \
-    "$image" bash -c "$1" >/dev/null
+    "$image" bash -c 'mkdir -p "$HOME" && eval "$1"' smoke "$1" >/dev/null
+  created=1
   local rc=0
   output="$(perl -e 'alarm 120; exec @ARGV' docker start -a "$name")" || rc=$?
   docker rm -f "$name" >/dev/null
+  created=0
   return "$rc"
 }
 
@@ -64,6 +75,10 @@ if run_in 'mkdir -p /tmp/p && cd /tmp/p && printf "[toolchain]\nchannel = \"1.80
   fail "a mismatched rust-toolchain.toml did not fail"
 fi
 echo "smoke-image: mismatched rust-toolchain.toml fails offline (expected)"
+
+# HOME is writable after the run creates it on the tmpfs.
+run_in 'git config --global user.name smoke && test "$(git config --global user.name)" = smoke' || fail "HOME is not writable"
+echo "smoke-image: HOME is writable (expected)"
 
 # The image path for CARGO_HOME is read-only at run time.
 if run_in 'touch /usr/local/cargo/config.toml'; then fail "CARGO_HOME is writable"; fi
