@@ -13,6 +13,16 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" && -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; t
     --ttl 900 --wait 600 --note "smoke $image" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
 fi
 
+# deadline SECONDS COMMAND...: run COMMAND; after SECONDS, kill it with SIGKILL and return 124. A
+# plain alarm is not enough: docker run and docker start -a forward SIGALRM to the container instead
+# of exiting, so the client would keep waiting. Killing the client does not stop a container.
+deadline() {
+  perl -e '$t = shift; $p = fork; die "fork: $!" unless defined $p;
+    if (!$p) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "KILL", $p; waitpid $p, 0; exit 124 };
+    alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+
 fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
 created=0
 leftover_check() {
@@ -30,8 +40,9 @@ leftover_check() {
 trap leftover_check EXIT
 
 # run_in SCRIPT: create, start, and remove one container; put its stdout in $output and return the
-# container's exit status. A setup failure (create, timeout, or remove) stops the test: it is never
-# counted as an expected failure.
+# container's exit status, read from Docker, not from the client. A setup failure (create, start,
+# timeout, or remove) stops the test: it is never counted as an expected failure. A container that
+# is still running when the client returns has timed out; the exit trap removes it.
 # The name is fixed on purpose (docs/hygiene.md section 5): a leftover from an interrupted run is a
 # conflict that this test reports, not litter that a fresh random name would hide.
 run_in() {
@@ -46,9 +57,12 @@ run_in() {
     --env CARGO_NET_OFFLINE=true \
     "$image" bash -c 'mkdir -p "$HOME" && eval "$1"' smoke "$1" >/dev/null || fail "docker create failed"
   created=1
-  local rc=0
-  output="$(perl -e 'alarm 120; exec @ARGV' docker start -a "$name")" || rc=$?
-  (( rc != 142 )) || fail "container timed out after 120 s"
+  output="$(deadline 120 docker start -a "$name")" || true
+  local state running rc start_error
+  state="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}} {{.State.Error}}' "$name")" || fail "could not inspect $name"
+  read -r running rc start_error <<<"$state"
+  [[ "$running" == false ]] || fail "container timed out after 120 s"
+  [[ -z "$start_error" ]] || fail "container did not start: $start_error"
   docker rm -f "$name" >/dev/null || fail "could not remove $name"
   created=0
   return "$rc"

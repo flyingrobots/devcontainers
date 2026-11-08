@@ -45,13 +45,28 @@ if [[ -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
     --ttl 2400 --wait 600 --note "build $tag" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
 fi
 
-# perl's alarm is the timeout, because macOS has no coreutils timeout by default.
-alarm() { local s="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+# perl is the timeout tool, because macOS has no coreutils timeout by default.
+# deadline SECONDS COMMAND...: run COMMAND; after SECONDS, kill it with SIGKILL and return 124. A
+# plain alarm is not enough: docker run and docker start -a forward SIGALRM to the container instead
+# of exiting, so the client would keep waiting. Killing the client does not stop a container.
+deadline() {
+  perl -e '$t = shift; $p = fork; die "fork: $!" unless defined $p;
+    if (!$p) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "KILL", $p; waitpid $p, 0; exit 124 };
+    alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
 
 if ! docker image inspect "$base" >/dev/null 2>&1; then
   echo "build-image: pulling $base" >&2
-  alarm 300 docker pull --quiet "$base" >/dev/null
+  deadline 300 docker pull --quiet "$base" >/dev/null
 fi
+# The free-space container's / is on the image store's filesystem only for overlay storage. Refuse
+# other storage, such as a stargz snapshotter, rather than measure the wrong filesystem.
+storage="$(docker info -f '{{.Driver}}')"
+case "$storage" in
+  overlay2|overlayfs) ;;
+  *) echo "build-image: cannot check free space for Docker storage driver '$storage'; use overlay2 or overlayfs" >&2; exit 3 ;;
+esac
 min_kib=$((50 * 1024 * 1024))
 host_free="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
 run_name=devcontainers-dev-run
@@ -63,9 +78,9 @@ if [[ -n "$leftover" ]]; then
   echo "build-image: leftover container $run_name exists (interrupted run?); inspect it, then: docker rm -f $run_name" >&2
   exit 3
 fi
-# The alarm stops only the docker client, so on failure remove the container this run started. It
+# The deadline stops only the docker client, so on failure remove the container this run started. It
 # carries this run's own label, so a container that someone else created under the name stays.
-vm_out="$(alarm 60 docker run --rm --pull never --name "$run_name" --network none \
+vm_out="$(deadline 60 docker run --rm --pull never --name "$run_name" --network none \
   --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
   --label "org.flyingrobots.run=$run_id" \
   --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 "${limits[@]}" \
@@ -82,4 +97,4 @@ if (( host_free < min_kib || vm_free < min_kib )); then
   exit 3
 fi
 
-exec perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${build[@]}"
+deadline "$timeout_s" "${build[@]}"
