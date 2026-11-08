@@ -40,9 +40,13 @@ enforces every rule here; a rule that only lives in this file is not enforced.
 
 - Non-root user with a fixed UID (`10001`), `--user 10001:10001`.
 - `--cap-drop ALL`, `--security-opt no-new-privileges`.
-- `--read-only` root filesystem. Writable places: `/work` (the copy, in a tmpfs
-  or the scratch volume), `/tmp` (tmpfs with a size limit), and the named
+- `--read-only` root filesystem. Writable places: `/scratch/work` (the copy,
+  inside the scratch volume), `/tmp` (tmpfs with a size limit), and the named
   volumes in section 5.
+- `CARGO_HOME` is the image path `/usr/local/cargo`, which is read-only at run
+  time, so no run can plant a cargo `config.toml` or a `credentials.toml`.
+- No `RUSTUP_TOOLCHAIN` in the image or the run: a repository's
+  `rust-toolchain.toml` must match the image, or the run fails offline.
 - Limits on every run: `--pids-limit`, `--memory` with `--memory-swap` equal to
   it, `--cpus`, `--ulimit nofile`.
 - Never `--privileged`, `--network host`, `--pid host`, `--ipc host`, or added
@@ -64,6 +68,10 @@ enforces every rule here; a rule that only lives in this file is not enforced.
 
 - Base images are pinned by digest (`rust@sha256:…`), not by tag. The digest is
   in the receipt.
+- Known gap: `clippy`, `rustfmt`, and the `wasm32-unknown-unknown` standard
+  library come from the rustup server at image build time. rustup checks each
+  file against the channel manifest for that exact version, but the manifest
+  itself is not pinned here. `cargo-deny` is pinned by SHA-256.
 - Every cargo command uses `--locked`. A changed `Cargo.lock` leaves the
   container only through an explicit patch export.
 - Images build with the default builder. No new `buildx` builder. A new image is
@@ -78,12 +86,16 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 | --- | --- | --- |
 | Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` |
 | Run container | `<project>-dev-run` (one at a time, under a lock) | `dev-run` |
-| Cargo registry cache | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` |
+| Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` |
+| Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` |
 | Build output, iteration | `<project>-target` | `target` |
 | Build output, evidence | `<project>-target-evidence`, emptied before each merge-gate run | `target-evidence` |
 | Logs, test data, exports | `<project>-scratch` | `scratch` |
 
 - No anonymous volumes. Images must not declare `VOLUME`.
+- The cargo caches are writable only in the fetch phase. The build phase mounts
+  them read-only, so a hostile build script cannot poison the cache for a later
+  run.
 - **Evidence runs use a fresh target.** A merge-gate run never reuses build
   output, so a stale cache cannot fabricate a passing result.
 

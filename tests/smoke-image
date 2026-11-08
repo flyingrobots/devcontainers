@@ -1,26 +1,71 @@
 #!/usr/bin/env bash
-# Smoke test for flyingrobots/rust-dev:<rust-version>. Runs one locked-down, labeled, offline container.
+# Smoke test for flyingrobots/rust-dev:<rust-version>. Each check runs in one locked-down, labeled,
+# offline container named devcontainers-dev-run (docs/hygiene.md sections 2, 3, 5, 7, 10).
+# On the workstation the whole test runs under the same git-locks keys as scripts/build-image.
 set -euo pipefail
 version="${1:?usage: tests/smoke-image <rust-version>}"
 image="flyingrobots/rust-dev:$version"
+name=devcontainers-dev-run
+
+if [[ "${GITHUB_ACTIONS:-}" != "true" && -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
+  exec env GIT_LOCKS_STORE="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}" DEVCONTAINERS_LOCK_HELD=1 \
+    git locks with --job "devcontainers-smoke-$(uuidgen)" --holder "${USER:-agent}-smoke-image" \
+    --ttl 900 --wait 600 --note "smoke $image" host/heavy-work host/docker/devcontainers-dev/ -- "$0" "$@"
+fi
+
 fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
+leftover_check() {
+  status=$?
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+    echo "smoke-image: FAIL: $name still exists" >&2
+    exit 1
+  fi
+  exit "$status"
+}
+trap leftover_check EXIT
+
+# run_in SCRIPT: create, start, and remove one container; print its output.
+run_in() {
+  docker create --name "$name" \
+    --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
+    --user 10001:10001 --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1024:1024 \
+    --env CARGO_NET_OFFLINE=true \
+    "$image" bash -c "$1" >/dev/null
+  local rc=0
+  output="$(perl -e 'alarm 120; exec @ARGV' docker start -a "$name")" || rc=$?
+  docker rm -f "$name" >/dev/null
+  return "$rc"
+}
 
 [[ "$(docker image inspect "$image" --format '{{json .Config.Volumes}}')" == "null" ]] || fail "image declares VOLUME"
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.owner"}}')" == "devcontainers" ]] || fail "owner label missing"
 [[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.role"}}')" == "base-image" ]] || fail "role label missing"
 [[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
+docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -q '^RUSTUP_TOOLCHAIN=' && fail "image sets RUSTUP_TOOLCHAIN"
 
-out="$(docker run --rm --name devcontainers-smoke-run \
-  --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
-  --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
-  --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
-  "$image" sh -c 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; git --version')"
-echo "$out"
-grep -q "^rustc $version " <<<"$out" || fail "rustc is not $version"
-grep -q '^clippy ' <<<"$out" || fail "clippy missing"
-grep -q '^rustfmt ' <<<"$out" || fail "rustfmt missing"
-grep -q '^wasm32-unknown-unknown$' <<<"$out" || fail "wasm32 target missing"
-grep -q '^cargo-deny 0.20.2$' <<<"$out" || fail "cargo-deny 0.20.2 missing"
-grep -qx '10001' <<<"$out" || fail "container does not run as uid 10001"
-docker ps -a --filter name=^devcontainers-smoke-run$ --format '{{.Names}}' | grep -q . && fail "smoke container was not removed"
+run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"'
+echo "$output"
+v="${version//./\\.}"
+grep -q "^rustc $v " <<<"$output" || fail "rustc is not $version"
+grep -q "^cargo $v " <<<"$output" || fail "cargo is not $version"
+grep -q "^clippy 0\.1\.$(cut -d. -f2 <<<"$version") " <<<"$output" || fail "clippy does not match $version"
+grep -q '^rustfmt [0-9.]*-stable' <<<"$output" || fail "rustfmt missing"
+grep -q '^wasm32-unknown-unknown$' <<<"$output" || fail "wasm32 target missing"
+grep -q '^cargo-deny 0\.20\.2$' <<<"$output" || fail "cargo-deny 0.20.2 missing"
+grep -qx '10001' <<<"$output" || fail "container does not run as uid 10001"
+grep -qx 'CARGO_HOME=/usr/local/cargo' <<<"$output" || fail "CARGO_HOME is not the read-only image path"
+
+# A repository that pins another toolchain must fail offline, not build with this compiler.
+if run_in 'mkdir -p /tmp/p && cd /tmp/p && printf "[toolchain]\nchannel = \"1.80.0\"\n" > rust-toolchain.toml && rustc --version'; then
+  fail "a mismatched rust-toolchain.toml did not fail"
+fi
+echo "smoke-image: mismatched rust-toolchain.toml fails offline (expected)"
+
+# The image path for CARGO_HOME is read-only at run time.
+if run_in 'touch /usr/local/cargo/config.toml'; then fail "CARGO_HOME is writable"; fi
+echo "smoke-image: CARGO_HOME is read-only (expected)"
+
 echo "smoke-image: PASS ($image)"

@@ -12,3 +12,19 @@ containers, never on the host.
 
 The rules are in [`docs/hygiene.md`](docs/hygiene.md). Work is tracked in GitHub
 Issues with `issue-dag/2` frontmatter.
+
+## Build and test the base image
+
+```sh
+scripts/build-image 1.96.0   # builds flyingrobots/rust-dev:1.96.0 under the git-locks keys
+tests/smoke-image 1.96.0     # checks it in offline, read-only, unprivileged containers
+```
+
+Pinned base digests live in `images/rust-dev/base-digests`, one line per Rust
+version. The image runs as UID 10001. Mount points for the named volumes:
+`/scratch` (copy, logs, exports), `/target` (build output),
+`/usr/local/cargo/registry`, and `/usr/local/cargo/git` (cargo caches).
+
+The guarded runner `bin/devrun` is not here yet (flyingrobots/devcontainers#3
+and #5). Until it lands, these two scripts are the only supported way to use
+Docker from this repository.

@@ -12,12 +12,19 @@ jobs:
   image:
     name: Build and smoke-test rust-dev
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Shellcheck
-        run: shellcheck scripts/* tests/*
+        run: shellcheck scripts/* tests/smoke-image
       - name: Build flyingrobots/rust-dev:1.96.0
         run: scripts/build-image 1.96.0
       - name: Smoke test
         run: tests/smoke-image 1.96.0
+      - name: Unchanged rebuild reuses the cache (same image ID)
+        run: |
+          first="$(docker image inspect -f '{{.Id}}' flyingrobots/rust-dev:1.96.0)"
+          scripts/build-image 1.96.0
+          second="$(docker image inspect -f '{{.Id}}' flyingrobots/rust-dev:1.96.0)"
+          echo "first=$first second=$second"
+          test "$first" = "$second"
