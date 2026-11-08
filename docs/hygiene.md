@@ -13,6 +13,12 @@ enforces every rule here; a rule that only lives in this file is not enforced.
   - `--commit <sha>` (default, and required for merge-gate evidence):
     `git archive <sha>` on the host, streamed into the container. The copy is
     exact and pinned. No `.git` is ever copied.
+  - `--history <base>..<head>` (for gates that read commit history, such as
+    Bunny's `repo-respect`): `git bundle create` on the host packs only the
+    commits from `<base>` to `<head>`. Inside the container, the runner clones a
+    brand-new repository from the bundle and sets `refs/remotes/origin/main` to
+    `<base>`. The clone has the real commits and messages, and it is not the
+    original `.git`. The runner checks that the clone's `HEAD` equals `<head>`.
   - `--worktree` (iteration only, marked *unpinned* in the receipt):
     `git ls-files -z --cached --others --exclude-standard
     --recurse-submodules`, streamed with `tar`. This includes new files that are
@@ -22,10 +28,13 @@ enforces every rule here; a rule that only lives in this file is not enforced.
   - no symlink with an absolute target or a target outside the copy;
   - no setuid or setgid bit, no device file, no named pipe;
   - the SHA-256 of the streamed tarball is recorded in the receipt.
-- **Git for tools that need it.** Some gates read git state (Bunny's
-  `repo-respect`, Geordi's `git ls-files` checks). Inside the container, the
-  runner creates a throwaway repository: `git init`, commit the base tree, then
-  stage the head tree. It is never a copy of a real `.git`.
+- **Git for tools that need it.** Gates that only list files (Geordi's
+  `git ls-files` checks, Bunny's `code-dojo --all`) get a throwaway repository:
+  `git init` in the copy, with nothing copied from a real `.git`. Gates that read
+  branch history or commit messages (Bunny's `repo-respect`) use `--history`.
+- **The only `.git` in a container is one the runner created inside it:** an
+  empty `git init` or a clone from a bundle. The copy check runs before that
+  step, so a `.git` that arrived with the source always fails the run.
 
 ## 2. Container privileges
 
