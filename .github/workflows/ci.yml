@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Shellcheck
-        run: shellcheck scripts/* tests/smoke-image
+        run: shellcheck scripts/* tests/smoke-image tests/integration-devrun
       - name: Build flyingrobots/rust-dev:1.96.0
         run: scripts/build-image 1.96.0
       - name: Smoke test
@@ -28,3 +28,7 @@ jobs:
           second="$(docker image inspect -f '{{.Id}}' flyingrobots/rust-dev:1.96.0)"
           echo "first=$first second=$second"
           test "$first" = "$second"
+      - name: devrun unit tests, in a container
+        run: bin/devrun devcontainers . --commit HEAD -- python3 -m unittest discover -s tests
+      - name: devrun integration test (real Docker)
+        run: tests/integration-devrun

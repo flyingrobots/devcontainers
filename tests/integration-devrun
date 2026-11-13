@@ -4,13 +4,13 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 devrun="$root/bin/devrun"
-project=devrun-selftest
+project="devrun-selftest"
 work="$(mktemp -d -t devrun-selftest-XXXXXX)"
 fail() { echo "integration-devrun: FAIL: $*" >&2; exit 1; }
 cleanup() {
   rm -rf "$work"
   docker rm -f "$project-dev-run" >/dev/null 2>&1 || true
-  for v in cargo-registry cargo-git target target-evidence scratch; do
+  for v in cargo-registry cargo-git target target-evidence work scratch; do
     if [[ "$(docker volume inspect "$project-$v" --format '{{index .Labels "org.flyingrobots.owner"}}' 2>/dev/null || true)" == "$project" ]]; then
       docker volume rm "$project-$v" >/dev/null
     fi
@@ -33,8 +33,12 @@ Repo-Respect-Receipt: none"
 head="$(git -C "$repo" rev-parse HEAD)"
 
 echo "== commit mode: isolation checks"
+# shellcheck disable=SC2016  # the probe's $(...) and $HOME must expand inside the container, not on the host.
 probe='set -e
 test "$(id -u)" = 10001
+test "$(pwd)" = /work
+test -d "$HOME" && touch "$HOME/probe"
+if touch /devrun-probe 2>/dev/null; then echo "the parent of /work is writable" >&2; exit 18; fi
 test -f README && test -L README.link && test "$(cat README.link | head -1)" = hello
 test -d .git  # created inside the container by devrun, empty baseline only
 test "$(git log --format=%s)" = "devrun baseline"
@@ -66,6 +70,34 @@ out3="$work/out3"
 "$devrun" "$project" "$repo" --history "$base..$head" --timeout 300 --export result.txt --out "$out3" -- \
   bash -c "test \"\$(git rev-parse HEAD)\" = $head && test \"\$(git rev-parse origin/main)\" = $base && git log -1 --format=%B | grep -q 'Repo-Respect-Receipt: none' && echo ok > /scratch/out/result.txt"
 [[ "$(cat "$out3/result.txt")" == "ok" ]] || fail "history mode"
+
+echo "== fetch phase: a planted cargo config runs no code while the caches are writable"
+crate="$work/crate"; mkdir -p "$crate/src" "$crate/.cargo"
+printf '[package]\nname = "selftest"\nversion = "0.1.0"\nedition = "2021"\n' > "$crate/Cargo.toml"
+printf 'version = 4\n\n[[package]]\nname = "selftest"\nversion = "0.1.0"\n' > "$crate/Cargo.lock"
+printf 'fn main() {}\n' > "$crate/src/main.rs"
+printf '#!/bin/sh\ntouch /usr/local/cargo/registry/devrun-pwned 2>/dev/null\ntouch /tmp/devrun-wrapper-ran\nexec "$@"\n' > "$crate/evil-wrapper"; chmod 755 "$crate/evil-wrapper"
+printf '[build]\nrustc-wrapper = "/work/evil-wrapper"\n' > "$crate/.cargo/config.toml"
+printf '[toolchain]\npath = "/work/evil-toolchain"\n' > "$crate/rust-toolchain.toml"
+git -C "$crate" init -q -b main && git -C "$crate" add -A && git -C "$crate" -c user.name=t -c user.email=t@invalid commit -qm fetch
+out4="$work/out4"
+# Two layers protect this phase: the fetch copy drops the config and toolchain files, and the
+# environment overrides them. Disabling both makes cargo honour the planted toolchain and fail here.
+if ! "$devrun" "$project" "$crate" --commit HEAD --fetch --timeout 300 --export result.txt --out "$out4" -- \
+  bash -c 'test ! -e /usr/local/cargo/registry/devrun-pwned && test -f .cargo/config.toml && test -f rust-toolchain.toml &&
+    # Control: with the config present, cargo fetch does call the wrapper, so the check above is not vacuous.
+    { RUSTUP_TOOLCHAIN=1.96.0 cargo fetch --locked >/dev/null 2>&1 || true; } && test -e /tmp/devrun-wrapper-ran &&
+    echo ok > /scratch/out/result.txt'; then
+  fail "the fetch phase honoured the planted cargo config or toolchain"
+fi
+[[ "$(cat "$out4/result.txt")" == "ok" ]] || fail "fetch phase ran the planted wrapper, or phase 2 lost the config files"
+
+echo "== an existing container with the run's name is refused and left alone"
+docker create --name "$project-dev-run" --label org.flyingrobots.owner=other flyingrobots/rust-dev:1.96.0 true >/dev/null
+if "$devrun" "$project" "$repo" --commit "$base" --timeout 60 -- true 2>"$work/err-exists"; then fail "ran despite an existing container"; fi
+grep -q 'already exists' "$work/err-exists" || fail "wrong refusal: $(cat "$work/err-exists")"
+docker ps -a --format '{{.Names}}' | grep -qx "$project-dev-run" || fail "devrun removed a container it did not create"
+docker rm "$project-dev-run" >/dev/null
 
 echo "== refusals"
 ln -s /etc/passwd "$repo/evil"; git -C "$repo" add evil; git -C "$repo" -c user.name=t -c user.email=t@invalid commit -qm "evil"

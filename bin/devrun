@@ -79,8 +79,8 @@ def sanitize_tar(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
     """Copy tar members from src to dst after checking each one. Returns the member count.
 
     Refuses .git, absolute or traversing paths, escaping or absolute symlinks,
-    hard links, devices, FIFOs, and anything that is not a file, directory, or
-    symlink. Strips setuid, setgid, and sticky bits, and sets the owner to 10001.
+    hard links, devices, FIFOs, setuid and setgid bits, and anything that is not
+    a file, directory, or symlink. Drops the sticky bit and sets the owner to 10001.
     """
     count = 0
     dirs_emitted = set()
@@ -121,6 +121,8 @@ def sanitize_tar(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
                 raise DevrunError(f"refused: hard link in source: {member.name!r}")
             elif not (member.isfile() or member.isdir()):
                 raise DevrunError(f"refused: special file in source: {member.name!r}")
+            if member.mode & 0o6000:
+                raise DevrunError(f"refused: setuid or setgid bit in source: {member.name!r}")
             clean = tarfile.TarInfo(path)
             clean.type = member.type
             clean.mode = member.mode & 0o777
@@ -135,6 +137,36 @@ def sanitize_tar(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
                 tout.addfile(clean, data)
             else:
                 tout.addfile(clean)
+            count += 1
+    return count
+
+
+FETCH_EXCLUDED_NAMES = {"rust-toolchain", "rust-toolchain.toml"}
+CARGO_CONFIG_NAMES = {"config", "config.toml"}
+
+
+def excluded_from_fetch(path: str) -> bool:
+    """True for files the fetch copy must not contain (docs/hygiene.md section 3).
+
+    A repository's `.cargo/config(.toml)` can name a compiler or wrapper, and its
+    `rust-toolchain(.toml)` can select a `path` toolchain; `cargo fetch` would run either
+    while the caches are writable. They are dropped at every depth.
+    """
+    parts = path.split("/")
+    name = parts[-1]
+    if name in FETCH_EXCLUDED_NAMES:
+        return True
+    return name in CARGO_CONFIG_NAMES and len(parts) >= 2 and parts[-2] == ".cargo"
+
+
+def fetch_copy(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
+    """Copy a sanitized tar, leaving out the files that could choose code for `cargo fetch`."""
+    count = 0
+    with tarfile.open(fileobj=src, mode="r|*") as tin, tarfile.open(fileobj=dst, mode="w|", format=tarfile.PAX_FORMAT) as tout:
+        for member in tin:
+            if member.isfile() and excluded_from_fetch(member.name):
+                continue
+            tout.addfile(member, tin.extractfile(member) if member.isfile() else None)
             count += 1
     return count
 
@@ -250,11 +282,12 @@ def build_history(repo: Path, spec: str, out_dir: Path) -> dict:
     p = run(["git", "-C", str(repo), "bundle", "create", str(bundle), *refs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise DevrunError(f"git bundle failed: {p.stderr.decode(errors='replace').strip()}")
-    # The head tree must pass the same checks as an archive copy.
+    # The head tree must pass the same checks as an archive copy. The sanitized tree is kept: the
+    # fetch phase uses it, because a fetch must not clone the bundle with its config files.
     with open(out_dir / "head-check.raw.tar", "wb") as fh:
         run(["git", "-C", str(repo), "archive", "--format=tar", head], stdout=fh, check=True)
-    with open(out_dir / "head-check.raw.tar", "rb") as fin:
-        sanitize_tar(fin, io.BytesIO())
+    with open(out_dir / "head-check.raw.tar", "rb") as fin, open(out_dir / "head.tar", "wb") as fout:
+        sanitize_tar(fin, fout)
     (out_dir / "head-check.raw.tar").unlink()
     tar_path = out_dir / "history.tar"
     with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as tout:
@@ -291,8 +324,9 @@ INNER_SCRIPT = r'''
 set -euo pipefail
 mode="$1"; shift
 export_patch="$1"; shift
-cd /scratch/work
+cd /work
 git_q() { git -c user.name=devrun -c user.email=devrun@invalid -c commit.gpgsign=false -c init.defaultBranch=main "$@"; }
+mkdir -p "$HOME"
 if [ "$mode" = history ]; then
   git_q init -q .
   git_q fetch -q /scratch/in/history.bundle '+refs/*:refs/devrun/*'
@@ -319,12 +353,18 @@ fi
 exit "$status"
 '''
 
+# Empties the copy and scratch volumes completely, hidden entries included, so nothing one run
+# plants (such as a .cargo/config.toml) reaches the next (docs/hygiene.md section 2).
 PREP_SCRIPT = r'''
 set -euo pipefail
-rm -rf /scratch/work /scratch/in /scratch/out
-mkdir -p /scratch/work /scratch/in /scratch/out
+find /work /scratch -mindepth 1 -delete
+mkdir -p /scratch/in /scratch/out
 if [ "$1" = 1 ]; then find /target -mindepth 1 -delete; fi
 '''
+
+# Phase 1. Runs no repository-chosen code: the copy has no cargo config or toolchain file, and the
+# environment pins the compiler and clears the wrappers (docs/hygiene.md section 3).
+FETCH_COMMAND = ["bash", "-c", 'mkdir -p "$HOME" && exec cargo fetch --locked']
 
 
 class Docker:
@@ -334,6 +374,9 @@ class Docker:
         self.cpus = cpus
         self.memory = memory
         self.name = f"{project}-dev-run"
+        # True only between a successful `docker create` by this run and its removal, so cleanup
+        # never touches a container that another run (or litter) owns under the same name.
+        self.created = False
 
     def labels(self, role: str) -> List[str]:
         return ["--label", f"{OWNER_LABEL}={self.project}", "--label", f"{ROLE_LABEL}={role}"]
@@ -363,14 +406,17 @@ class Docker:
                 "--mount", f"type=volume,src={self.project}-cargo-registry,dst=/usr/local/cargo/registry{ro}",
                 "--mount", f"type=volume,src={self.project}-cargo-git,dst=/usr/local/cargo/git{ro}",
                 "--mount", f"type=volume,src={target_volume},dst=/target",
+                "--mount", f"type=volume,src={self.project}-work,dst=/work",
                 "--mount", f"type=volume,src={self.project}-scratch,dst=/scratch",
-                "--workdir", "/scratch/work"]
+                "--env", "HOME=/tmp/home",
+                "--workdir", "/work"]
         for k, v in (env or {}).items():
             args += ["--env", f"{k}={v}"]
         args += [self.image, *cmd]
         p = run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise DevrunError(f"docker create failed: {p.stderr.decode(errors='replace').strip()}")
+        self.created = True
 
     def copy_in(self, tar_path: Path, dest: str) -> None:
         with open(tar_path, "rb") as fh:
@@ -398,7 +444,11 @@ class Docker:
         return written
 
     def remove(self) -> None:
+        """Remove the run container, only if this run created it."""
+        if not self.created:
+            return
         run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.created = False
 
     def exists(self) -> bool:
         p = run(["docker", "ps", "-a", "--filter", f"name=^{self.name}$", "--format", "{{.Names}}"], stdout=subprocess.PIPE)
@@ -466,6 +516,30 @@ def fresh_out_dir(arg: Optional[str]) -> Path:
     return out
 
 
+def fetch_environment(env: dict, rust_version: str) -> dict:
+    """The fetch phase's environment: these variables override any cargo configuration file, so the
+    image's compiler runs with no wrapper even if a config file slipped through."""
+    return dict(env, RUSTUP_TOOLCHAIN=rust_version, RUSTC="/usr/local/cargo/bin/rustc",
+                RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
+
+
+def prepare(docker: "Docker", target_volume: str, empty_target: bool) -> None:
+    """Empty the copy and scratch volumes (and the evidence target when asked), offline."""
+    docker.create(["bash", "-c", PREP_SCRIPT, "prep", "1" if empty_target else "0"], False, target_volume)
+    if docker.start(300) != 0:
+        raise DevrunError("preparing the work and scratch volumes failed")
+    docker.remove()
+
+
+def copy_in(docker: "Docker", target_volume: str, tar_path: Path, dest: str, env: dict) -> None:
+    """Extract a sanitized tar into the volumes through a short-lived, offline container."""
+    docker.create(["true"], False, target_volume, env)
+    docker.copy_in(tar_path, dest)
+    if docker.start(300) != 0:
+        raise DevrunError("copy-in container failed")
+    docker.remove()
+
+
 def main_inner(ns: argparse.Namespace) -> int:
     repo = Path(ns.repo).resolve()
     top = Path(git(repo, "rev-parse", "--show-toplevel"))
@@ -496,36 +570,25 @@ def main_inner(ns: argparse.Namespace) -> int:
         docker.ensure_volume(f"{ns.project}-cargo-registry", "cargo-registry")
         docker.ensure_volume(f"{ns.project}-cargo-git", "cargo-git")
         docker.ensure_volume(target_volume, "target-evidence" if ns.evidence else "target")
+        docker.ensure_volume(f"{ns.project}-work", "work")
         docker.ensure_volume(f"{ns.project}-scratch", "scratch")
-        # Phase 0: reset the scratch area (and the evidence target) offline.
-        docker.create(["bash", "-c", PREP_SCRIPT, "prep", "1" if ns.evidence else "0"], False, target_volume)
-        if docker.start(300) != 0:
-            raise DevrunError("preparing the scratch volume failed")
-        docker.remove()
         env = {"DEVRUN_HEAD": facts.get("sha") or "", "DEVRUN_BASE": facts.get("base") or ""}
-        # Copy-in container: extract the source into the scratch volume.
-        dest = "/scratch/in" if mode == "history" else "/scratch/work"
-        docker.create(["true"], False, target_volume, env)
-        docker.copy_in(tar_path, dest)
-        if docker.start(300) != 0:
-            raise DevrunError("copy-in container failed")
-        docker.remove()
+        dest = "/scratch/in" if mode == "history" else "/work"
         if ns.fetch:
-            # Phase 1: fetch dependencies with network, nothing else.
-            fetch = ["bash", "-c", INNER_SCRIPT, "fetch", mode, "0", "cargo", "fetch", "--locked"]
-            docker.create(fetch, True, target_volume, env, caches_writable=True)
+            # Phase 1: fetch dependencies with network and writable caches, from a copy that has no
+            # cargo config or toolchain file, with the compiler pinned and the wrappers cleared.
+            fetch_tar = work / "fetch.tar"
+            with open(work / "head.tar" if mode == "history" else tar_path, "rb") as fin, open(fetch_tar, "wb") as fout:
+                fetch_copy(fin, fout)
+            prepare(docker, target_volume, ns.evidence)
+            copy_in(docker, target_volume, fetch_tar, "/work", env)
+            docker.create(FETCH_COMMAND, True, target_volume, fetch_environment(env, ns.rust), caches_writable=True)
             if docker.start(ns.timeout) != 0:
                 raise DevrunError("cargo fetch --locked failed")
             docker.remove()
-            if mode != "history":
-                # The fetch phase created the throwaway repository; start phase 2 from a clean copy again.
-                docker.create(["bash", "-c", PREP_SCRIPT, "prep", "0"], False, target_volume)
-                docker.start(300)
-                docker.remove()
-                docker.create(["true"], False, target_volume, env)
-                docker.copy_in(tar_path, dest)
-                docker.start(300)
-                docker.remove()
+        # Phase 2 starts from empty volumes and a fresh copy, whatever phase 1 left behind.
+        prepare(docker, target_volume, ns.evidence and not ns.fetch)
+        copy_in(docker, target_volume, tar_path, dest, env)
         # Phase 2: the command, offline unless --network.
         cmd = ["bash", "-c", INNER_SCRIPT, "run", mode, "1" if ns.export_patch else "0", *ns.command]
         env["CARGO_NET_OFFLINE"] = "false" if ns.network else "true"
@@ -556,7 +619,7 @@ def main(argv: List[str]) -> int:
         job = f"devrun-{ns.project}-{uuid.uuid4()}"
         lock = ["git", "locks", "with", "--job", job, "--holder", f"devrun-{os.getpid()}",
                 "--ttl", str(ns.timeout + 900), "--wait", "600", "--note", f"devrun {ns.project}",
-                "host/heavy-work", f"host/docker/{ns.project}-dev/", "--",
+                "host/heavy-work", f"host/docker/{ns.project}-dev-run/", "--",
                 sys.executable, os.path.abspath(__file__), *argv]
         env = dict(os.environ, GIT_LOCKS_STORE=os.environ.get("GIT_LOCKS_STORE", LOCK_STORE), **{LOCK_ENV: job})
         return subprocess.call(lock, env=env)
