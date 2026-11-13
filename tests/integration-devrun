@@ -5,11 +5,17 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 devrun="$root/bin/devrun"
 project="devrun-selftest"
-work="$(mktemp -d -t devrun-selftest-XXXXXX)"
 fail() { echo "integration-devrun: FAIL: $*" >&2; exit 1; }
+# A container with the run's name belongs to someone else: refuse to start rather than touch it.
+if docker container inspect "$project-dev-run" >/dev/null 2>&1; then
+  fail "container $project-dev-run already exists; remove it or wait for its owner"
+fi
+work="$(mktemp -d -t devrun-selftest-XXXXXX)"
+planted=0  # 1 while the decoy container created by this script exists
 cleanup() {
   rm -rf "$work"
-  docker rm -f "$project-dev-run" >/dev/null 2>&1 || true
+  # devrun removes its own containers; this script removes only the decoy it created.
+  if [[ "$planted" == 1 ]]; then docker rm -f "$project-dev-run" >/dev/null 2>&1 || true; fi
   for v in cargo-registry cargo-git target target-evidence work scratch; do
     if [[ "$(docker volume inspect "$project-$v" --format '{{index .Labels "org.flyingrobots.owner"}}' 2>/dev/null || true)" == "$project" ]]; then
       docker volume rm "$project-$v" >/dev/null
@@ -94,10 +100,12 @@ fi
 
 echo "== an existing container with the run's name is refused and left alone"
 docker create --name "$project-dev-run" --label org.flyingrobots.owner=other flyingrobots/rust-dev:1.96.0 true >/dev/null
+planted=1
 if "$devrun" "$project" "$repo" --commit "$base" --timeout 60 -- true 2>"$work/err-exists"; then fail "ran despite an existing container"; fi
 grep -q 'already exists' "$work/err-exists" || fail "wrong refusal: $(cat "$work/err-exists")"
 docker ps -a --format '{{.Names}}' | grep -qx "$project-dev-run" || fail "devrun removed a container it did not create"
 docker rm "$project-dev-run" >/dev/null
+planted=0
 
 echo "== refusals"
 ln -s /etc/passwd "$repo/evil"; git -C "$repo" add evil; git -C "$repo" -c user.name=t -c user.email=t@invalid commit -qm "evil"
