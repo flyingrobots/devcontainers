@@ -326,7 +326,7 @@ mode="$1"; shift
 export_patch="$1"; shift
 cd /work
 git_q() { git -c user.name=devrun -c user.email=devrun@invalid -c commit.gpgsign=false -c init.defaultBranch=main "$@"; }
-mkdir -p "$HOME"
+mkdir -p "$HOME" "$TMPDIR"
 if [ "$mode" = history ]; then
   git_q init -q .
   git_q fetch -q /scratch/in/history.bundle '+refs/*:refs/devrun/*'
@@ -364,7 +364,7 @@ if [ "$1" = 1 ]; then find /target -mindepth 1 -delete; fi
 
 # Phase 1. Runs no repository-chosen code: the copy has no cargo config or toolchain file, and the
 # environment pins the compiler and clears the wrappers (docs/hygiene.md section 3).
-FETCH_COMMAND = ["bash", "-c", 'mkdir -p "$HOME" && exec cargo fetch --locked']
+FETCH_COMMAND = ["bash", "-c", 'mkdir -p "$HOME" "$TMPDIR" && exec cargo fetch --locked']
 
 
 class Docker:
@@ -409,6 +409,9 @@ class Docker:
                 "--mount", f"type=volume,src={self.project}-work,dst=/work",
                 "--mount", f"type=volume,src={self.project}-scratch,dst=/scratch",
                 "--env", "HOME=/tmp/home",
+                # Docker mounts --tmpfs noexec, so test binaries (rustdoc's doctests) cannot run
+                # from /tmp. TMPDIR is on the scratch volume, which allows execution.
+                "--env", "TMPDIR=/scratch/tmp",
                 "--workdir", "/work"]
         for k, v in (env or {}).items():
             args += ["--env", f"{k}={v}"]
