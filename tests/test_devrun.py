@@ -211,6 +211,8 @@ class ContainerOwnership(unittest.TestCase):
         create = self.calls[-1]
         self.assertIn("type=volume,src=geordi-work,dst=/work", create)
         self.assertIn("HOME=/tmp/home", create)
+        self.assertIn("TMPDIR=/exec-tmp", create)
+        self.assertIn("/exec-tmp:rw,nosuid,nodev,exec,size=1g,mode=1777", create)
         self.assertEqual(create[create.index("--workdir") + 1], "/work")
 
 
