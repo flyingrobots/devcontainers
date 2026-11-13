@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""devrun: run a repository command in a locked-down, copy-in container.
+
+Rules: docs/hygiene.md (ULTRAMAX PARANOIA). The repository is copied in, never
+mounted. The tarball is checked and rewritten on the host before Docker sees it.
+Each run claims git-locks keys, uses fixed names and owner labels, and removes
+its container on every exit path.
+
+Usage:
+  devrun PROJECT REPO (--commit SHA | --history BASE..HEAD | --worktree)
+         [--rust VERSION | --image IMAGE] [--fetch] [--network] [--evidence]
+         [--export PATH]... [--export-patch] [--out DIR] [--timeout SECONDS]
+         [--cpus N] [--memory SIZE] -- COMMAND [ARG...]
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import os
+import posixpath
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+UID = 10001
+GID = 10001
+OWNER_LABEL = "org.flyingrobots.owner"
+ROLE_LABEL = "org.flyingrobots.role"
+PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+LOCK_STORE = "/Users/Shared/git-locks/workstation.git"
+LOCK_ENV = "DEVRUN_LOCK_JOB"
+DEFAULT_RUST = "1.96.0"
+
+
+class DevrunError(Exception):
+    """A refusal or failure with a message for the operator."""
+
+
+# --------------------------------------------------------------------------- #
+# Host-side tarball checks (docs/hygiene.md section 1)
+# --------------------------------------------------------------------------- #
+
+
+def _safe_member_path(name: str) -> str:
+    if name.startswith("/") or name.startswith("\\"):
+        raise DevrunError(f"refused: absolute path in source: {name!r}")
+    norm = posixpath.normpath(name)
+    if norm == ".":
+        return "."
+    parts = norm.split("/")
+    if ".." in parts:
+        raise DevrunError(f"refused: path traversal in source: {name!r}")
+    if ".git" in parts:
+        raise DevrunError(f"refused: .git in source: {name!r}")
+    return norm
+
+
+def _check_symlink(member_path: str, target: str) -> None:
+    if target.startswith("/"):
+        raise DevrunError(f"refused: absolute symlink {member_path!r} -> {target!r}")
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member_path), target))
+    if resolved == ".." or resolved.startswith("../") or "/../" in f"/{resolved}/":
+        raise DevrunError(f"refused: symlink escapes the source {member_path!r} -> {target!r}")
+    if ".git" in resolved.split("/"):
+        raise DevrunError(f"refused: symlink into .git {member_path!r} -> {target!r}")
+
+
+def sanitize_tar(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
+    """Copy tar members from src to dst after checking each one. Returns the member count.
+
+    Refuses .git, absolute or traversing paths, escaping or absolute symlinks,
+    hard links, devices, FIFOs, setuid and setgid bits, and anything that is not
+    a file, directory, or symlink. Drops the sticky bit and sets the owner to 10001.
+    """
+    count = 0
+    dirs_emitted = set()
+
+    def emit_parents(path: str, mtime: int) -> None:
+        # Docker creates missing parent directories as root, which UID 10001 then cannot clean up.
+        # Emit every parent explicitly, owned by 10001.
+        parent = posixpath.dirname(path)
+        chain = []
+        while parent and parent not in dirs_emitted:
+            chain.append(parent)
+            parent = posixpath.dirname(parent)
+        for d in reversed(chain):
+            info = tarfile.TarInfo(d)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            info.uid, info.gid = UID, GID
+            info.uname = info.gname = "dev"
+            info.mtime = mtime
+            tout.addfile(info)
+            dirs_emitted.add(d)
+
+    with tarfile.open(fileobj=src, mode="r|*") as tin, tarfile.open(fileobj=dst, mode="w|", format=tarfile.PAX_FORMAT) as tout:
+        for member in tin:
+            if member.type in (tarfile.XHDTYPE, tarfile.XGLTYPE):
+                continue
+            path = _safe_member_path(member.name)
+            if path == ".":
+                continue
+            emit_parents(path, int(member.mtime))
+            if member.isdir():
+                if path in dirs_emitted:
+                    continue
+                dirs_emitted.add(path)
+            if member.issym():
+                _check_symlink(path, member.linkname)
+            elif member.islnk():
+                raise DevrunError(f"refused: hard link in source: {member.name!r}")
+            elif not (member.isfile() or member.isdir()):
+                raise DevrunError(f"refused: special file in source: {member.name!r}")
+            if member.mode & 0o6000:
+                raise DevrunError(f"refused: setuid or setgid bit in source: {member.name!r}")
+            clean = tarfile.TarInfo(path)
+            clean.type = member.type
+            clean.mode = member.mode & 0o777
+            clean.uid, clean.gid = UID, GID
+            clean.uname = clean.gname = "dev"
+            clean.mtime = member.mtime
+            if member.issym():
+                clean.linkname = member.linkname
+            if member.isfile():
+                clean.size = member.size
+                data = tin.extractfile(member)
+                tout.addfile(clean, data)
+            else:
+                tout.addfile(clean)
+            count += 1
+    return count
+
+
+FETCH_EXCLUDED_NAMES = {"rust-toolchain", "rust-toolchain.toml"}
+CARGO_CONFIG_NAMES = {"config", "config.toml"}
+
+
+def excluded_from_fetch(path: str) -> bool:
+    """True for files the fetch copy must not contain (docs/hygiene.md section 3).
+
+    A repository's `.cargo/config(.toml)` can name a compiler or wrapper, and its
+    `rust-toolchain(.toml)` can select a `path` toolchain; `cargo fetch` would run either
+    while the caches are writable. They are dropped at every depth.
+    """
+    parts = path.split("/")
+    name = parts[-1]
+    if name in FETCH_EXCLUDED_NAMES:
+        return True
+    return name in CARGO_CONFIG_NAMES and len(parts) >= 2 and parts[-2] == ".cargo"
+
+
+def fetch_copy(src: io.BufferedIOBase, dst: io.BufferedIOBase) -> int:
+    """Copy a sanitized tar, leaving out the files that could choose code for `cargo fetch`."""
+    count = 0
+    with tarfile.open(fileobj=src, mode="r|*") as tin, tarfile.open(fileobj=dst, mode="w|", format=tarfile.PAX_FORMAT) as tout:
+        for member in tin:
+            if member.isfile() and excluded_from_fetch(member.name):
+                continue
+            tout.addfile(member, tin.extractfile(member) if member.isfile() else None)
+            count += 1
+    return count
+
+
+def check_export_tar(src: io.BufferedIOBase, dest: Path) -> List[str]:
+    """Extract an export tarball from Docker into dest, allowing only regular files and directories."""
+    written: List[str] = []
+    with tarfile.open(fileobj=src, mode="r|*") as tin:
+        for member in tin:
+            path = _safe_member_path(member.name)
+            target = dest / path
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise DevrunError(f"refused export: not a regular file: {member.name!r}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = tin.extractfile(member)
+            with open(target, "xb") as fh:
+                while True:
+                    chunk = data.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            os.chmod(target, 0o644)
+            written.append(path)
+    return written
+
+
+# --------------------------------------------------------------------------- #
+# Source modes
+# --------------------------------------------------------------------------- #
+
+
+def run(cmd: List[str], **kw) -> subprocess.CompletedProcess:
+    kw.setdefault("check", False)
+    return subprocess.run(cmd, **kw)
+
+
+def git(repo: Path, *args: str, capture: bool = True) -> str:
+    p = run(["git", "-C", str(repo), *args], stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"git {' '.join(args)} failed: {p.stderr.decode(errors='replace').strip()}")
+    return p.stdout.decode().strip() if capture else ""
+
+
+def resolve_commit(repo: Path, rev: str) -> str:
+    return git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")
+
+
+def build_source_tar(repo: Path, mode: str, rev: Optional[str], out: Path) -> dict:
+    """Write the sanitized source tar to out. Returns facts for the receipt."""
+    raw = out.with_suffix(".raw.tar")
+    facts: dict = {"mode": mode}
+    if mode == "commit":
+        sha = resolve_commit(repo, rev or "HEAD")
+        facts["sha"] = sha
+        with open(raw, "wb") as fh:
+            p = run(["git", "-C", str(repo), "archive", "--format=tar", sha], stdout=fh, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise DevrunError(f"git archive failed: {p.stderr.decode(errors='replace').strip()}")
+    elif mode == "worktree":
+        listing = run(["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--stage"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if listing.returncode != 0:
+            raise DevrunError(f"git ls-files failed: {listing.stderr.decode(errors='replace').strip()}")
+        names = sorted(set(_worktree_paths(repo)))
+        facts["sha"] = None
+        facts["unpinned"] = True
+        with tarfile.open(raw, "w", format=tarfile.PAX_FORMAT) as tout:
+            for rel in names:
+                full = repo / rel
+                try:
+                    st = os.lstat(full)
+                except FileNotFoundError:
+                    continue  # tracked but deleted in the worktree
+                if stat.S_ISDIR(st.st_mode):
+                    raise DevrunError(f"refused: {rel!r} is a directory in the listing (submodule?); worktree mode does not support submodules")
+                tout.add(str(full), arcname=rel, recursive=False)
+    else:
+        raise DevrunError(f"unknown mode {mode}")
+    with open(raw, "rb") as fin, open(out, "wb") as fout:
+        facts["members"] = sanitize_tar(fin, fout)
+    raw.unlink()
+    facts["tar_sha256"] = sha256_file(out)
+    return facts
+
+
+def _worktree_paths(repo: Path) -> Iterable[str]:
+    p = run(["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"git ls-files failed: {p.stderr.decode(errors='replace').strip()}")
+    gitlinks = run(["git", "-C", str(repo), "ls-files", "-z", "--stage"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.split(b"\0")
+    if any(entry.startswith(b"160000 ") for entry in gitlinks):
+        raise DevrunError("refused: worktree mode does not support submodules")
+    for name in p.stdout.split(b"\0"):
+        if name:
+            yield name.decode()
+
+
+def build_history(repo: Path, spec: str, out_dir: Path) -> dict:
+    if ".." not in spec:
+        raise DevrunError("--history needs BASE..HEAD")
+    base_rev, head_rev = spec.split("..", 1)
+    base, head = resolve_commit(repo, base_rev), resolve_commit(repo, head_rev)
+    # A bundle records refs, and it must carry the full ancestry to be cloneable. Use existing refs
+    # that contain the commits; never create refs in the source repository.
+    refs = _containing_refs(repo, head)
+    base_is_ancestor = run(["git", "-C", str(repo), "merge-base", "--is-ancestor", base, head]).returncode == 0
+    if not base_is_ancestor:
+        refs += [r for r in _containing_refs(repo, base) if r not in refs][:1]
+    bundle = out_dir / "history.bundle"
+    p = run(["git", "-C", str(repo), "bundle", "create", str(bundle), *refs], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"git bundle failed: {p.stderr.decode(errors='replace').strip()}")
+    # The head tree must pass the same checks as an archive copy. The sanitized tree is kept: the
+    # fetch phase uses it, because a fetch must not clone the bundle with its config files.
+    with open(out_dir / "head-check.raw.tar", "wb") as fh:
+        run(["git", "-C", str(repo), "archive", "--format=tar", head], stdout=fh, check=True)
+    with open(out_dir / "head-check.raw.tar", "rb") as fin, open(out_dir / "head.tar", "wb") as fout:
+        sanitize_tar(fin, fout)
+    (out_dir / "head-check.raw.tar").unlink()
+    tar_path = out_dir / "history.tar"
+    with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as tout:
+        info = tarfile.TarInfo("history.bundle")
+        info.size = bundle.stat().st_size
+        info.uid, info.gid, info.uname, info.gname, info.mode = UID, GID, "dev", "dev", 0o644
+        with open(bundle, "rb") as fh:
+            tout.addfile(info, fh)
+    bundle.unlink()
+    return {"mode": "history", "sha": head, "base": base, "tar_sha256": sha256_file(tar_path)}
+
+
+def _containing_refs(repo: Path, sha: str) -> List[str]:
+    refs = [r for r in git(repo, "for-each-ref", "--contains", sha, "--format=%(refname)").splitlines() if r]
+    if not refs:
+        raise DevrunError(f"refused: commit {sha} is not reachable from any ref")
+    preferred = [r for r in refs if r.startswith("refs/heads/")] + [r for r in refs if r.startswith("refs/remotes/")]
+    return (preferred or refs)[:1]
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Containers (docs/hygiene.md sections 2, 3, 5, 7)
+# --------------------------------------------------------------------------- #
+
+INNER_SCRIPT = r'''
+set -euo pipefail
+mode="$1"; shift
+export_patch="$1"; shift
+cd /work
+git_q() { git -c user.name=devrun -c user.email=devrun@invalid -c commit.gpgsign=false -c init.defaultBranch=main "$@"; }
+mkdir -p "$HOME"
+if [ "$mode" = history ]; then
+  git_q init -q .
+  git_q fetch -q /scratch/in/history.bundle '+refs/*:refs/devrun/*'
+  git_q update-ref refs/heads/main "$DEVRUN_HEAD"
+  git_q update-ref refs/remotes/origin/main "$DEVRUN_BASE"
+  git_q checkout -q main
+  git for-each-ref --format='%(refname)' refs/devrun/ | while read -r r; do git_q update-ref -d "$r"; done
+  test "$(git rev-parse HEAD)" = "$DEVRUN_HEAD" || { echo "devrun: clone HEAD does not match $DEVRUN_HEAD" >&2; exit 97; }
+else
+  if find . -name .git -print -quit | grep -q .; then echo "devrun: .git found in the copy" >&2; exit 98; fi
+  git_q init -q .
+  git_q add -A
+  git_q commit -q --allow-empty -m "devrun baseline"
+fi
+baseline="$(git rev-parse HEAD)"
+set +e
+"$@"
+status=$?
+set -e
+if [ "$export_patch" = 1 ]; then
+  git_q add -A
+  git_q diff --cached --binary "$baseline" > /scratch/out/changes.patch
+fi
+exit "$status"
+'''
+
+# Empties the copy and scratch volumes completely, hidden entries included, so nothing one run
+# plants (such as a .cargo/config.toml) reaches the next (docs/hygiene.md section 2).
+PREP_SCRIPT = r'''
+set -euo pipefail
+find /work /scratch -mindepth 1 -delete
+mkdir -p /scratch/in /scratch/out
+if [ "$1" = 1 ]; then find /target -mindepth 1 -delete; fi
+'''
+
+# Phase 1. Runs no repository-chosen code: the copy has no cargo config or toolchain file, and the
+# environment pins the compiler and clears the wrappers (docs/hygiene.md section 3).
+FETCH_COMMAND = ["bash", "-c", 'mkdir -p "$HOME" && exec cargo fetch --locked']
+
+
+class Docker:
+    def __init__(self, project: str, image: str, cpus: str, memory: str, network_default: bool):
+        self.project = project
+        self.image = image
+        self.cpus = cpus
+        self.memory = memory
+        self.name = f"{project}-dev-run"
+        # True only between a successful `docker create` by this run and its removal, so cleanup
+        # never touches a container that another run (or litter) owns under the same name.
+        self.created = False
+
+    def labels(self, role: str) -> List[str]:
+        return ["--label", f"{OWNER_LABEL}={self.project}", "--label", f"{ROLE_LABEL}={role}"]
+
+    def ensure_volume(self, name: str, role: str) -> None:
+        p = run(["docker", "volume", "inspect", name, "--format", "{{json .Labels}}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode == 0:
+            labels = json_loads(p.stdout.decode() or "null") or {}
+            if labels.get(OWNER_LABEL) != self.project:
+                raise DevrunError(f"refused: volume {name} exists but is not owned by {self.project}")
+            return
+        p = run(["docker", "volume", "create", *self.labels(role), name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise DevrunError(f"docker volume create {name} failed: {p.stderr.decode(errors='replace').strip()}")
+
+    def create(self, cmd: List[str], network: bool, target_volume: str, env: Optional[dict] = None,
+               caches_writable: bool = False) -> None:
+        """Create the run container. The cargo caches are writable only in the fetch phase."""
+        ro = "" if caches_writable else ",readonly"
+        args = ["docker", "create", "--name", self.name, *self.labels("dev-run"),
+                "--user", f"{UID}:{GID}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,mode=1777",
+                "--pids-limit", "4096", "--memory", self.memory, "--memory-swap", self.memory, "--cpus", self.cpus,
+                "--ulimit", "nofile=65536:65536",
+                "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+                "--network", "bridge" if network else "none",
+                "--mount", f"type=volume,src={self.project}-cargo-registry,dst=/usr/local/cargo/registry{ro}",
+                "--mount", f"type=volume,src={self.project}-cargo-git,dst=/usr/local/cargo/git{ro}",
+                "--mount", f"type=volume,src={target_volume},dst=/target",
+                "--mount", f"type=volume,src={self.project}-work,dst=/work",
+                "--mount", f"type=volume,src={self.project}-scratch,dst=/scratch",
+                "--env", "HOME=/tmp/home",
+                "--workdir", "/work"]
+        for k, v in (env or {}).items():
+            args += ["--env", f"{k}={v}"]
+        args += [self.image, *cmd]
+        p = run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise DevrunError(f"docker create failed: {p.stderr.decode(errors='replace').strip()}")
+        self.created = True
+
+    def copy_in(self, tar_path: Path, dest: str) -> None:
+        with open(tar_path, "rb") as fh:
+            p = run(["docker", "cp", "-a", "-", f"{self.name}:{dest}"], stdin=fh, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise DevrunError(f"docker cp into {dest} failed: {p.stderr.decode(errors='replace').strip()}")
+
+    def start(self, timeout: int) -> int:
+        try:
+            p = run(["docker", "start", "-a", self.name], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            run(["docker", "kill", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise DevrunError(f"timeout after {timeout}s; container killed")
+        return p.returncode
+
+    def export(self, path: str, dest: Path) -> List[str]:
+        p = subprocess.Popen(["docker", "cp", f"{self.name}:/scratch/out/{path}", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            written = check_export_tar(p.stdout, dest)
+        finally:
+            p.stdout.close()
+            err = p.stderr.read().decode(errors="replace").strip()
+            if p.wait() != 0:
+                raise DevrunError(f"export of {path!r} failed: {err}")
+        return written
+
+    def remove(self) -> None:
+        """Remove the run container, only if this run created it."""
+        if not self.created:
+            return
+        run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.created = False
+
+    def exists(self) -> bool:
+        p = run(["docker", "ps", "-a", "--filter", f"name=^{self.name}$", "--format", "{{.Names}}"], stdout=subprocess.PIPE)
+        return bool(p.stdout.strip())
+
+
+def json_loads(text: str):
+    import json
+    return json.loads(text)
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    if "--" not in argv:
+        raise DevrunError("missing '--' before COMMAND")
+    i = argv.index("--")
+    head, command = argv[:i], argv[i + 1:]
+    if not command:
+        raise DevrunError("missing COMMAND after '--'")
+    ap = argparse.ArgumentParser(prog="devrun", description="Run a command in a locked-down copy-in container.")
+    ap.add_argument("project")
+    ap.add_argument("repo")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--commit", metavar="SHA")
+    src.add_argument("--history", metavar="BASE..HEAD")
+    src.add_argument("--worktree", action="store_true")
+    img = ap.add_mutually_exclusive_group()
+    img.add_argument("--rust", default=DEFAULT_RUST)
+    img.add_argument("--image")
+    ap.add_argument("--fetch", action="store_true", help="run cargo fetch --locked with network first")
+    ap.add_argument("--network", action="store_true", help="give the command itself network access")
+    ap.add_argument("--evidence", action="store_true", help="use an emptied evidence target volume")
+    ap.add_argument("--export", action="append", default=[], metavar="PATH")
+    ap.add_argument("--export-patch", action="store_true")
+    ap.add_argument("--out", metavar="DIR")
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--cpus", default="4")
+    ap.add_argument("--memory", default="8g")
+    ns = ap.parse_args(head)
+    if not PROJECT_RE.fullmatch(ns.project):
+        raise DevrunError(f"invalid project name {ns.project!r} (lowercase letters, digits, hyphens)")
+    if ns.timeout <= 0 or ns.timeout > 7200:
+        raise DevrunError("--timeout must be between 1 and 7200 seconds")
+    for e in ns.export:
+        _safe_member_path(e)
+    ns.command = command
+    return ns
+
+
+def fresh_out_dir(arg: Optional[str]) -> Path:
+    if arg:
+        out = Path(arg).resolve()
+        if out.exists() and any(out.iterdir()):
+            raise DevrunError(f"refused: --out {out} is not empty")
+    else:
+        out = Path(tempfile.mkdtemp(prefix="devrun-out-"))
+    probe = run(["git", "-C", str(out if out.exists() else out.parent), "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if probe.returncode == 0:
+        raise DevrunError(f"refused: --out {out} is inside a git repository")
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def fetch_environment(env: dict, rust_version: str) -> dict:
+    """The fetch phase's environment: these variables override any cargo configuration file, so the
+    image's compiler runs with no wrapper even if a config file slipped through."""
+    return dict(env, RUSTUP_TOOLCHAIN=rust_version, RUSTC="/usr/local/cargo/bin/rustc",
+                RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="")
+
+
+def prepare(docker: "Docker", target_volume: str, empty_target: bool) -> None:
+    """Empty the copy and scratch volumes (and the evidence target when asked), offline."""
+    docker.create(["bash", "-c", PREP_SCRIPT, "prep", "1" if empty_target else "0"], False, target_volume)
+    if docker.start(300) != 0:
+        raise DevrunError("preparing the work and scratch volumes failed")
+    docker.remove()
+
+
+def copy_in(docker: "Docker", target_volume: str, tar_path: Path, dest: str, env: dict) -> None:
+    """Extract a sanitized tar into the volumes through a short-lived, offline container."""
+    docker.create(["true"], False, target_volume, env)
+    docker.copy_in(tar_path, dest)
+    if docker.start(300) != 0:
+        raise DevrunError("copy-in container failed")
+    docker.remove()
+
+
+def main_inner(ns: argparse.Namespace) -> int:
+    repo = Path(ns.repo).resolve()
+    top = Path(git(repo, "rev-parse", "--show-toplevel"))
+    out = fresh_out_dir(ns.out)
+    work = Path(tempfile.mkdtemp(prefix="devrun-src-"))
+    image = ns.image or f"flyingrobots/rust-dev:{ns.rust}"
+    docker = Docker(ns.project, image, ns.cpus, ns.memory, ns.network)
+    target_volume = f"{ns.project}-target-evidence" if ns.evidence else f"{ns.project}-target"
+    stop = {"flag": False}
+
+    def on_signal(signum, _frame):
+        docker.remove()
+        raise DevrunError(f"interrupted by signal {signum}; container removed")
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    try:
+        if ns.history:
+            facts = build_history(top, ns.history, work)
+            tar_path, mode = work / "history.tar", "history"
+        else:
+            mode = "commit" if ns.commit else "worktree"
+            tar_path = work / "source.tar"
+            facts = build_source_tar(top, mode, ns.commit, tar_path)
+        print(f"devrun: source {mode} {facts.get('sha') or '(unpinned worktree)'} {facts['tar_sha256']}", file=sys.stderr)
+        if docker.exists():
+            raise DevrunError(f"refused: container {docker.name} already exists (another run, or litter)")
+        docker.ensure_volume(f"{ns.project}-cargo-registry", "cargo-registry")
+        docker.ensure_volume(f"{ns.project}-cargo-git", "cargo-git")
+        docker.ensure_volume(target_volume, "target-evidence" if ns.evidence else "target")
+        docker.ensure_volume(f"{ns.project}-work", "work")
+        docker.ensure_volume(f"{ns.project}-scratch", "scratch")
+        env = {"DEVRUN_HEAD": facts.get("sha") or "", "DEVRUN_BASE": facts.get("base") or ""}
+        dest = "/scratch/in" if mode == "history" else "/work"
+        if ns.fetch:
+            # Phase 1: fetch dependencies with network and writable caches, from a copy that has no
+            # cargo config or toolchain file, with the compiler pinned and the wrappers cleared.
+            fetch_tar = work / "fetch.tar"
+            with open(work / "head.tar" if mode == "history" else tar_path, "rb") as fin, open(fetch_tar, "wb") as fout:
+                fetch_copy(fin, fout)
+            prepare(docker, target_volume, ns.evidence)
+            copy_in(docker, target_volume, fetch_tar, "/work", env)
+            docker.create(FETCH_COMMAND, True, target_volume, fetch_environment(env, ns.rust), caches_writable=True)
+            if docker.start(ns.timeout) != 0:
+                raise DevrunError("cargo fetch --locked failed")
+            docker.remove()
+        # Phase 2 starts from empty volumes and a fresh copy, whatever phase 1 left behind.
+        prepare(docker, target_volume, ns.evidence and not ns.fetch)
+        copy_in(docker, target_volume, tar_path, dest, env)
+        # Phase 2: the command, offline unless --network.
+        cmd = ["bash", "-c", INNER_SCRIPT, "run", mode, "1" if ns.export_patch else "0", *ns.command]
+        env["CARGO_NET_OFFLINE"] = "false" if ns.network else "true"
+        docker.create(cmd, ns.network, target_volume, env)
+        status = docker.start(ns.timeout)
+        exported: List[str] = []
+        for path in ns.export:
+            exported += docker.export(path, out)
+        if ns.export_patch:
+            exported += docker.export("changes.patch", out)
+        docker.remove()
+        if docker.exists():
+            raise DevrunError(f"container {docker.name} still exists after removal")
+        print(f"devrun: exit {status}; exports in {out}: {', '.join(exported) or 'none'}", file=sys.stderr)
+        return status
+    finally:
+        docker.remove()
+        for p in work.glob("*"):
+            p.unlink()
+        work.rmdir()
+
+
+def main(argv: List[str]) -> int:
+    try:
+        ns = parse_args(argv)
+        if os.environ.get("CI") == "true" or os.environ.get(LOCK_ENV):
+            return main_inner(ns)
+        job = f"devrun-{ns.project}-{uuid.uuid4()}"
+        lock = ["git", "locks", "with", "--job", job, "--holder", f"devrun-{os.getpid()}",
+                "--ttl", str(ns.timeout + 900), "--wait", "600", "--note", f"devrun {ns.project}",
+                "host/heavy-work", f"host/docker/{ns.project}-dev-run/", "--",
+                sys.executable, os.path.abspath(__file__), *argv]
+        env = dict(os.environ, GIT_LOCKS_STORE=os.environ.get("GIT_LOCKS_STORE", LOCK_STORE), **{LOCK_ENV: job})
+        return subprocess.call(lock, env=env)
+    except DevrunError as exc:
+        print(f"devrun: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

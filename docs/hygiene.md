@@ -20,11 +20,15 @@ image build and a smoke test.
     `git archive <sha>` on the host, streamed into the container. The copy is
     exact and pinned. No `.git` is ever copied.
   - `--history <base>..<head>` (for gates that read commit history, such as
-    Bunny's `repo-respect`): `git bundle create` on the host packs only the
-    commits from `<base>` to `<head>`. Inside the container, the runner clones a
-    brand-new repository from the bundle and sets `refs/remotes/origin/main` to
-    `<base>`. The clone has the real commits and messages, and it is not the
-    original `.git`. The runner checks that the clone's `HEAD` equals `<head>`.
+    Bunny's `repo-respect`): `git bundle create` on the host packs an existing
+    ref that contains `<head>` (and one that contains `<base>` when it is not an
+    ancestor). A bundle must carry the full ancestry to be cloneable, so it holds
+    more than `<base>..<head>`; it is still an object export, never the original
+    `.git`, and the runner never creates refs in the source repository. Inside the
+    container, the runner fetches the bundle into a brand-new repository, pins
+    `main` to `<head>` and `refs/remotes/origin/main` to `<base>`, and deletes the
+    temporary refs. It checks that `HEAD` equals `<head>`. The `<head>` tree must
+    also pass the archive checks on the host.
   - `--worktree` (iteration only, marked *unpinned* in the receipt):
     `git ls-files -z --cached --others --exclude-standard
     --recurse-submodules`, streamed with `tar`. This includes new files that are
