@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Build flyingrobots/rust-dev:<rust-version> from the digest pinned in images/rust-dev/base-digests.
+# On the workstation it runs under the git-locks keys host/heavy-work and host/docker/devcontainers-dev-run/
+# (docs/hygiene.md section 10), with a 30-minute timeout inside a 40-minute lease (section 7), and it
+# refuses to start below 50 GiB free on the host or in the Docker VM (section 8). Time budget inside
+# the lease: base pull 300 s + free-space check 60 s + build 1800 s = 2160 s, below the 2400 s lease.
+set -euo pipefail
+version="${1:?usage: scripts/build-image <rust-version>}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+base="$(awk -v v="$version" '$1 == v { print $2 }' "$root/images/rust-dev/base-digests")"
+if [[ -z "$base" ]]; then
+  echo "build-image: no pinned digest for Rust $version in images/rust-dev/base-digests" >&2
+  exit 2
+fi
+tag="flyingrobots/rust-dev:$version"
+build=(docker build
+  --file "$root/images/rust-dev/Dockerfile"
+  --build-arg "BASE_IMAGE=$base"
+  --build-arg "RUST_VERSION=$version"
+  --label "org.flyingrobots.base-digest=$base"
+  # No provenance or SBOM attestations: they carry a per-build timestamp, so an unchanged rebuild
+  # would get a new image ID (issue #2 acceptance criterion: same ID on an unchanged rebuild).
+  --provenance=false --sbom=false
+  --tag "$tag"
+  "$root/images/rust-dev")
+timeout_s=1800
+limits=(--pids-limit 32 --memory 128m --memory-swap 128m --cpus 0.5 --ulimit nofile=256:256)
+
+# Only a docker-driver builder loads the result into the local image store under its tag (section 4).
+driver="$(docker buildx inspect | awk '$1 == "Driver:" { print $2; exit }')"
+if [[ "$driver" != "docker" ]]; then
+  echo "build-image: the selected buildx builder uses driver '${driver:-unknown}'; select a docker-driver builder first" >&2
+  exit 4
+fi
+
+# GitHub Actions runners are single-use machines with no shared git-locks store. Keep the timeout.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  exec timeout "$timeout_s" "${build[@]}"
+fi
+
+if [[ -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
+  # Default store: the shared workstation store on this macOS machine.
+  exec env GIT_LOCKS_STORE="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}" DEVCONTAINERS_LOCK_HELD=1 \
+    git locks with --job "devcontainers-build-$(uuidgen)" --holder "${USER:-agent}-build-image" \
+    --ttl 2400 --wait 600 --note "build $tag" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
+fi
+
+# perl is the timeout tool, because macOS has no coreutils timeout by default.
+# deadline SECONDS COMMAND...: run COMMAND; after SECONDS, kill it with SIGKILL and return 124. A
+# plain alarm is not enough: docker run and docker start -a forward SIGALRM to the container instead
+# of exiting, so the client would keep waiting. Killing the client does not stop a container.
+deadline() {
+  perl -e '$t = shift; $p = fork; die "fork: $!" unless defined $p;
+    if (!$p) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "KILL", $p; waitpid $p, 0; exit 124 };
+    alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+
+if ! docker image inspect "$base" >/dev/null 2>&1; then
+  echo "build-image: pulling $base" >&2
+  deadline 300 docker pull --quiet "$base" >/dev/null
+fi
+# The free-space container's / is on the image store's filesystem only for overlay storage. Refuse
+# other storage, such as a stargz snapshotter, rather than measure the wrong filesystem.
+storage="$(docker info -f '{{.Driver}}')"
+case "$storage" in
+  overlay2|overlayfs) ;;
+  *) echo "build-image: cannot check free space for Docker storage driver '$storage'; use overlay2 or overlayfs" >&2; exit 3 ;;
+esac
+min_kib=$((50 * 1024 * 1024))
+host_free="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
+run_name=devcontainers-dev-run
+run_id="build-$(uuidgen)"
+# A leftover from an interrupted run stays for inspection; this script never removes it. A failed
+# listing stops the script (set -e), so an error never reads as "no leftover".
+leftover="$(docker ps -a -q --filter "name=^${run_name}\$")"
+if [[ -n "$leftover" ]]; then
+  echo "build-image: leftover container $run_name exists (interrupted run?); inspect it, then: docker rm -f $run_name" >&2
+  exit 3
+fi
+# The deadline stops only the docker client, so on failure remove the container this run started. It
+# carries this run's own label, so a container that someone else created under the name stays.
+vm_out="$(deadline 60 docker run --rm --pull never --name "$run_name" --network none \
+  --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
+  --label "org.flyingrobots.run=$run_id" \
+  --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 "${limits[@]}" \
+  --entrypoint df "$base" -Pk /)" || {
+  mine="$(docker ps -a -q --filter "label=org.flyingrobots.run=$run_id" || true)"
+  [[ -z "$mine" ]] || docker rm -f "$mine" >/dev/null 2>&1 || true
+  echo "build-image: could not measure Docker VM free space (failed or timed out)" >&2
+  exit 3
+}
+vm_free="$(awk 'NR == 2 { print $4 }' <<<"$vm_out")"
+[[ "$vm_free" =~ ^[0-9]+$ ]] || { echo "build-image: unexpected df output: $vm_out" >&2; exit 3; }
+if (( host_free < min_kib || vm_free < min_kib )); then
+  echo "build-image: refusing to start: less than 50 GiB free (host ${host_free} KiB, Docker VM ${vm_free} KiB)" >&2
+  exit 3
+fi
+
+deadline "$timeout_s" "${build[@]}"

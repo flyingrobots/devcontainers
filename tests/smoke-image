@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Smoke test for flyingrobots/rust-dev:<rust-version>. Each check runs in one locked-down, labeled,
+# offline container named devcontainers-dev-run (docs/hygiene.md sections 2, 3, 5, 7, 10).
+# On the workstation the whole test runs under the same git-locks keys as scripts/build-image.
+set -euo pipefail
+version="${1:?usage: tests/smoke-image <rust-version>}"
+image="flyingrobots/rust-dev:$version"
+name=devcontainers-dev-run
+
+if [[ "${GITHUB_ACTIONS:-}" != "true" && -z "${DEVCONTAINERS_LOCK_HELD:-}" ]]; then
+  exec env GIT_LOCKS_STORE="${GIT_LOCKS_STORE:-/Users/Shared/git-locks/workstation.git}" DEVCONTAINERS_LOCK_HELD=1 \
+    git locks with --job "devcontainers-smoke-$(uuidgen)" --holder "${USER:-agent}-smoke-image" \
+    --ttl 900 --wait 600 --note "smoke $image" host/heavy-work host/docker/devcontainers-dev-run/ -- "$0" "$@"
+fi
+
+# deadline SECONDS COMMAND...: run COMMAND; after SECONDS, kill it with SIGKILL and return 124. A
+# plain alarm is not enough: docker run and docker start -a forward SIGALRM to the container instead
+# of exiting, so the client would keep waiting. Killing the client does not stop a container.
+deadline() {
+  perl -e '$t = shift; $p = fork; die "fork: $!" unless defined $p;
+    if (!$p) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "KILL", $p; waitpid $p, 0; exit 124 };
+    alarm $t; waitpid $p, 0; exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+
+fail() { echo "smoke-image: FAIL: $*" >&2; exit 1; }
+created=0
+leftover_check() {
+  status=$?
+  # Remove only a container this run created; a pre-existing leftover stays for inspection.
+  if (( created )); then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if [[ -n "$(docker ps -a -q --filter "name=^${name}\$")" ]]; then
+      echo "smoke-image: FAIL: $name still exists" >&2
+      exit 1
+    fi
+  fi
+  exit "$status"
+}
+trap leftover_check EXIT
+
+# run_in SCRIPT: create, start, and remove one container; put its stdout in $output and return the
+# container's exit status, read from Docker, not from the client. A setup failure (create, start,
+# timeout, or remove) stops the test: it is never counted as an expected failure. A container that
+# is still running when the client returns has timed out; the exit trap removes it.
+# The name is fixed on purpose (docs/hygiene.md section 5): a leftover from an interrupted run is a
+# conflict that this test reports, not litter that a fresh random name would hide.
+run_in() {
+  local leftover
+  leftover="$(docker ps -a -q --filter "name=^${name}\$")" || fail "could not list containers"
+  [[ -z "$leftover" ]] || fail "leftover container $name exists (interrupted run?); inspect it, then: docker rm -f $name"
+  docker create --name "$name" \
+    --label org.flyingrobots.owner=devcontainers --label org.flyingrobots.role=dev-run \
+    --user 10001:10001 --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 --ulimit nofile=1024:1024 \
+    --env CARGO_NET_OFFLINE=true \
+    "$image" bash -c 'mkdir -p "$HOME" && eval "$1"' smoke "$1" >/dev/null || fail "docker create failed"
+  created=1
+  output="$(deadline 120 docker start -a "$name")" || true
+  local state running rc start_error
+  state="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}} {{.State.Error}}' "$name")" || fail "could not inspect $name"
+  read -r running rc start_error <<<"$state"
+  [[ "$running" == false ]] || fail "container timed out after 120 s"
+  [[ -z "$start_error" ]] || fail "container did not start: $start_error"
+  docker rm -f "$name" >/dev/null || fail "could not remove $name"
+  created=0
+  return "$rc"
+}
+
+docker image inspect "$image" >/dev/null 2>&1 || fail "image $image not found; build it with scripts/build-image $version"
+[[ "$(docker image inspect "$image" --format '{{json .Config.Volumes}}')" == "null" ]] || fail "image declares VOLUME"
+[[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.owner"}}')" == "devcontainers" ]] || fail "owner label missing"
+[[ "$(docker image inspect "$image" --format '{{index .Config.Labels "org.flyingrobots.role"}}')" == "base-image" ]] || fail "role label missing"
+[[ "$(docker image inspect "$image" --format '{{.Config.User}}')" == "10001:10001" ]] || fail "image does not run as 10001"
+[[ "$(docker image inspect "$image" --format '{{.Config.WorkingDir}}')" == "/work" ]] || fail "working directory is not /work"
+env_list="$(docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+if grep -q '^RUSTUP_TOOLCHAIN=' <<<"$env_list"; then fail "image sets RUSTUP_TOOLCHAIN"; fi
+
+# shellcheck disable=SC2016  # \${CARGO_HOME} must expand inside the container, not on the host.
+run_in 'rustc --version; cargo --version; cargo clippy --version; rustfmt --version; rustup target list --installed; cargo deny --version; id -u; echo "CARGO_HOME=${CARGO_HOME:-unset}"; for d in /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git; do echo "owner $d $(stat -c %u:%g "$d")"; done'
+echo "$output"
+v="${version//./\\.}"
+grep -q "^rustc $v " <<<"$output" || fail "rustc is not $version"
+grep -q "^cargo $v " <<<"$output" || fail "cargo is not $version"
+grep -q "^clippy 0\.1\.$(cut -d. -f2 <<<"$version") " <<<"$output" || fail "clippy does not match $version"
+grep -q '^rustfmt [0-9.]*-stable' <<<"$output" || fail "rustfmt missing"
+grep -q '^wasm32-unknown-unknown$' <<<"$output" || fail "wasm32 target missing"
+grep -q '^cargo-deny 0\.20\.2$' <<<"$output" || fail "cargo-deny 0.20.2 missing"
+grep -qx '10001' <<<"$output" || fail "container does not run as uid 10001"
+grep -qx 'CARGO_HOME=/usr/local/cargo' <<<"$output" || fail "CARGO_HOME is not the read-only image path"
+for d in /work /scratch /target /usr/local/cargo/registry /usr/local/cargo/git; do
+  grep -qx "owner $d 10001:10001" <<<"$output" || fail "$d is not owned by 10001 (a new named volume copies this ownership)"
+done
+
+# A repository that pins another toolchain must fail, not build with this compiler. The marker shows
+# the container reached the check; the error must be rustup failing to install on the read-only root.
+if run_in 'mkdir -p /tmp/p && cd /tmp/p && printf "[toolchain]\nchannel = \"1.80.0\"\n" > rust-toolchain.toml && echo reached && rustc --version 2>&1'; then
+  fail "a mismatched rust-toolchain.toml did not fail"
+fi
+grep -qx reached <<<"$output" || fail "mismatched-toolchain check did not run"
+grep -q 'Read-only file system' <<<"$output" || fail "mismatched toolchain failed for another reason: $output"
+echo "smoke-image: mismatched rust-toolchain.toml fails on the read-only root (expected)"
+
+# HOME is writable after the run creates it on the tmpfs.
+# shellcheck disable=SC2016  # $(git config ...) must expand inside the container, not on the host.
+run_in 'git config --global user.name smoke && test "$(git config --global user.name)" = smoke' || fail "HOME is not writable"
+echo "smoke-image: HOME is writable (expected)"
+
+# Under --read-only, the image path for CARGO_HOME cannot take a planted config.
+if run_in 'echo reached && touch /usr/local/cargo/config.toml 2>&1'; then fail "CARGO_HOME is writable"; fi
+grep -qx reached <<<"$output" || fail "CARGO_HOME check did not run"
+grep -q 'Read-only file system' <<<"$output" || fail "CARGO_HOME check failed for another reason: $output"
+echo "smoke-image: CARGO_HOME is read-only under --read-only (expected)"
+
+echo "smoke-image: PASS ($image)"
