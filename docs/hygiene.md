@@ -51,8 +51,9 @@ image build and a smoke test.
 - Non-root user with a fixed UID (`10001`), `--user 10001:10001`.
 - `--cap-drop ALL`, `--security-opt no-new-privileges`.
 - `--read-only` root filesystem. Writable places: `/work` (the copy, at the
-  root of the work volume), `/scratch` (which also holds `TMPDIR`, `/scratch/tmp`,
-  because Docker mounts the `/tmp` tmpfs `noexec`), `/tmp` (tmpfs with a size limit), the
+  root of the work volume), `/scratch`, `/tmp` (tmpfs with a size limit, `noexec`),
+  `/exec-tmp` (`TMPDIR`: an `exec` tmpfs, also 1 GiB, so test binaries such as doctests
+  can run), the
   other named volumes in section 5, and Docker's own `/dev/shm` and
   `/dev/mqueue`.
 - **No writable directory above the copy.** Cargo reads `.cargo/config.toml` in

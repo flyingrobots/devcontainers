@@ -44,7 +44,10 @@ probe='set -e
 test "$(id -u)" = 10001
 test "$(pwd)" = /work
 test -d "$HOME" && touch "$HOME/probe"
-test "$TMPDIR" = /scratch/tmp && printf "#!/bin/sh\necho ran\n" > "$TMPDIR/exe" && chmod +x "$TMPDIR/exe" && test "$("$TMPDIR/exe")" = ran
+test "$TMPDIR" = /exec-tmp
+printf "#!/bin/sh\necho ran\n" > "$TMPDIR/exe"
+chmod +x "$TMPDIR/exe"
+test "$("$TMPDIR/exe")" = ran
 if touch /devrun-probe 2>/dev/null; then echo "the parent of /work is writable" >&2; exit 18; fi
 test -f README && test -L README.link && test "$(cat README.link | head -1)" = hello
 test -d .git  # created inside the container by devrun, empty baseline only

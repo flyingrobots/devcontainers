@@ -409,9 +409,12 @@ class Docker:
                 "--mount", f"type=volume,src={self.project}-work,dst=/work",
                 "--mount", f"type=volume,src={self.project}-scratch,dst=/scratch",
                 "--env", "HOME=/tmp/home",
-                # Docker mounts --tmpfs noexec, so test binaries (rustdoc's doctests) cannot run
-                # from /tmp. TMPDIR is on the scratch volume, which allows execution.
-                "--env", "TMPDIR=/scratch/tmp",
+                # Docker mounts --tmpfs noexec by default, so test binaries (rustdoc's doctests)
+                # cannot run from /tmp. TMPDIR is a separate tmpfs that allows execution, capped at
+                # 1 GiB like /tmp. It is not under /scratch: preparation empties /scratch and could
+                # not remove a mount point there.
+                "--tmpfs", "/exec-tmp:rw,nosuid,nodev,exec,size=1g,mode=1777",
+                "--env", "TMPDIR=/exec-tmp",
                 "--workdir", "/work"]
         for k, v in (env or {}).items():
             args += ["--env", f"{k}={v}"]
