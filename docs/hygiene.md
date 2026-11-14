@@ -5,11 +5,12 @@ is hostile. The host, its git repositories, its credentials, and other projects'
 Docker resources must stay unreachable and unchanged. The runner (`bin/devrun`)
 enforces every rule here; a rule that only lives in this file is not enforced.
 
-**Status:** `bin/devrun` is not merged yet (flyingrobots/devcontainers#3). Until
-it is, the rules about runs (copy-in, network phases, run-phase mounts, prep,
-outputs, audit) are its specification, and nothing enforces them.
-`scripts/build-image` and `tests/smoke-image` enforce the rules that apply to an
-image build and a smoke test.
+**Status:** `bin/devrun` enforces the rules about runs (copy-in, network
+phases, run-phase mounts, prep, outputs, names, concurrency). The litter audit,
+the receipts, and the budget checks (sections 8 and 9) are not implemented yet
+(flyingrobots/devcontainers#5): until they are, those sections are a
+specification. `scripts/build-image` and `tests/smoke-image` enforce the rules
+that apply to an image build and a smoke test.
 
 ## 1. Source isolation
 
@@ -58,10 +59,12 @@ image build and a smoke test.
   `/dev/mqueue`.
 - **No writable directory above the copy.** Cargo reads `.cargo/config.toml` in
   the working directory and in every parent directory. The copy is the root of
-  its own volume, so its only parent is the read-only root. Before each copy-in,
-  the runner empties the work and scratch volumes completely, hidden entries
-  included, so a `.cargo/config.toml` that one run leaves behind never reaches
-  the next.
+  its own volume, so its only parent is the read-only root. Each run creates its
+  own work and scratch volumes, new and empty, and removes them at the end, so a
+  `.cargo/config.toml` that one run leaves behind never reaches another run.
+  Before each copy-in (the fetch copy, then the command copy) the runner also
+  empties both volumes completely, hidden entries included, so nothing the fetch
+  phase leaves reaches the command phase.
 - `CARGO_HOME` is the image path `/usr/local/cargo`. It is read-only only
   because the run uses `--read-only`: the base image leaves it and the toolchain
   world-writable. Under `--read-only`, a run cannot plant a cargo `config.toml`
@@ -116,27 +119,68 @@ image build and a smoke test.
 
 ## 5. Names, labels, and volumes
 
-Every resource has a fixed name and the labels `org.flyingrobots.owner=<project>`
-and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
+Every resource has a name built from the project (and, for one run's own
+resources, the run id) and the labels `org.flyingrobots.owner=<project>` and
+`org.flyingrobots.role=<role>`. A run's own container and volumes also carry
+`org.flyingrobots.run-id=<run-id>`, so cleanup can prove which run created
+them. Cleanup selects by these labels only, and a name must match its labels.
 
-| Resource | Name | Role label |
-| --- | --- | --- |
-| Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` |
-| Upstream base, the build input | `rust@sha256:<digest>` from `images/rust-dev/base-digests`, pulled by digest. It carries only upstream labels. Keep it while its digest line exists; after removing the line, remove it with `docker image rm`. | none (upstream image) |
-| Run container | `<project>-dev-run` (one at a time, under a lock) | `dev-run` |
-| Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` |
-| Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` |
-| Build output, iteration | `<project>-target` | `target` |
-| Build output, evidence | `<project>-target-evidence`, emptied before each merge-gate run | `target-evidence` |
-| The copy, at `/work` | `<project>-work`, emptied before each copy-in | `work` |
-| Inputs, logs, test data, exports, at `/scratch` | `<project>-scratch`, emptied before each copy-in | `scratch` |
+A run id is 12 hexadecimal digits from a random UUID, new for every run. A
+source key is the first 16 hexadecimal digits of the SHA-256 of the real path
+of the repository's top-level directory (`git rev-parse --show-toplevel`,
+symlinks resolved), so each git worktree has its own key.
+
+| Resource | Name | Role label | Lifetime |
+| --- | --- | --- | --- |
+| Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` | Until a new toolchain replaces it |
+| Upstream base, the build input | `rust@sha256:<digest>` from `images/rust-dev/base-digests`, pulled by digest. It carries only upstream labels. Keep it while its digest line exists; after removing the line, remove it with `docker image rm`. | none (upstream image) | As left |
+| Run container | `<project>-dev-run-<run-id>`, also labelled with the run id | `dev-run` | One run; removed by the run |
+| Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` | Kept |
+| Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` | Kept |
+| Build output, iteration | `<project>-target-<source-key>`, also labelled `org.flyingrobots.source-path=<real path>` and `org.flyingrobots.source-key=<source-key>` (one per worktree) | `target` | Kept; `devrun --gc` removes it once the worktree path no longer exists |
+| Build output, evidence | `<project>-target-evidence-<run-id>`, new and empty for each `--evidence` run, also labelled with the run id | `target-evidence` | One run; removed by the run |
+| The copy, at `/work` | `<project>-work-<run-id>`, also labelled with the run id | `work` | One run; removed by the run |
+| Inputs, logs, test data, exports, at `/scratch` | `<project>-scratch-<run-id>`, also labelled with the run id | `scratch` | One run; removed by the run |
 
 - No anonymous volumes. Images must not declare `VOLUME`.
 - The cargo caches are writable only in the fetch phase, which runs no code
   that the repository chooses (section 3). The build phase mounts them
   read-only, so a hostile build script cannot poison the cache for a later run.
 - **Evidence runs use a fresh target.** A merge-gate run never reuses build
-  output, so a stale cache cannot fabricate a passing result.
+  output, so a stale cache cannot fabricate a passing result. The evidence target
+  belongs to the one run, so concurrent evidence runs never share one.
+- A run refuses a shared volume (a cache or a target) that exists with other
+  labels: another owner, another role, or, for a target, another source path or
+  key. It refuses a per-run volume or a container that already exists under its
+  name.
+- Fixed-name volumes from earlier versions of the runner (`<project>-work`,
+  `<project>-scratch`, `<project>-target`, `<project>-target-evidence`) are no
+  longer used. They have no run id or source label, so `devrun --gc` never
+  removes them; remove them by hand with `docker volume rm` once no older runner
+  uses them.
+
+### What concurrent runs share
+
+Runs of different projects share nothing but the image. Concurrent runs of one
+project share only these, and each sharing has a reason:
+
+- **The cargo caches**, read-only for every command phase. Only a fetch phase
+  writes them, and fetch phases of one project take turns (section 10), so
+  there is never more than one writer. A command phase can read the caches while
+  another run's fetch phase adds to them. Cargo writes a crate's sources into a
+  new directory and marks it complete last; a reader that needs a crate it did
+  not fetch itself finds it missing or incomplete and fails, because it cannot
+  write. This is cargo's design and is not tested here. The writer still runs no
+  repository-chosen code, so the poisoning rule above holds as before; what is
+  new is only that a read and a write can happen at the same moment.
+- **The iteration target of one worktree**, read-write, when two runs come from
+  the same worktree at once. Cargo's build-directory lock (`.cargo-lock` in the
+  target, a file lock that works across containers on one Docker volume)
+  serializes cargo's own builds in it; cargo prints "Blocking waiting for file
+  lock on build directory". A command that writes `/target` without cargo is not
+  serialized. One run's build scripts can change what the other run builds from,
+  which was already true of consecutive runs: the iteration target is never
+  evidence. Runs from different worktrees never share a target.
 
 ## 6. Outputs
 
@@ -149,15 +193,30 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 
 ## 7. Lifecycle
 
-- Each run is `docker create`, copy in, `docker start -a`, export, `docker rm`.
-- A cleanup trap removes the container on success, failure, timeout, and
-  signals.
+- Each run creates its volumes, then for each phase does `docker create`, copy
+  in, `docker start -a`, export, `docker rm`, and finally removes its volumes.
+- Cleanup removes the container and the per-run volumes on success, failure,
+  timeout, and SIGTERM or SIGINT. After the first signal, further signals are
+  ignored, so they cannot cut cleanup short. Cleanup removes only what this run
+  created; the run's own records say what that is.
+- A run that is killed outright (SIGKILL, a host crash) cannot clean up. Its
+  resources stay, labelled with its run id, and `devrun --gc <project>` removes
+  them (section 10). Its container may keep running until its command ends,
+  because the timeout lives in the killed process; `--gc` leaves a running
+  container alone and says so.
 - The command runs under a timeout that is shorter than the `git-locks` lease.
 
 ## 8. Budgets and free space
 
 - Build output: at most 20 GiB per project. Logs and test data: at most 4 GiB,
   including at most 128 MiB of logs.
+- The build output of a project is the sum over its iteration targets, one per
+  worktree, plus the evidence targets of the runs in progress. Each target can
+  reach the size of a full debug build of the workspace, so a handful of
+  worktrees, or a few concurrent evidence runs, can exceed 20 GiB, which a
+  single per-project target could not. Until the measurement exists, remove the
+  targets of deleted worktrees with `devrun --gc <project>` and keep the number
+  of worktrees that build in mind.
 - The runner measures the volumes after each run and fails above a budget.
   Named volumes do not enforce size, so the measurement is the guard.
 - The run does not start when the host or the Docker VM has less than 50 GiB
@@ -167,19 +226,95 @@ and `org.flyingrobots.role=<role>`. Cleanup selects by these labels only.
 
 - Before and after each run, the runner lists containers, volumes, networks, and
   images. The run fails when Docker has any new resource that is not named and
-  labeled per section 5, or when the run container still exists.
+  labeled per section 5, or when the run container still exists. Concurrent
+  runs of the same project create resources while the audit runs, so the audit
+  must attribute each new resource by its run id label, not by its project
+  alone.
 - Every run writes a receipt: image digest, copy mode, source SHA, tarball
   SHA-256, command, network mode, limits, exit code, duration, audit result, and
   volume sizes.
 
-## 10. Locks
+## 10. Concurrency
 
-- Each run claims `host/heavy-work` and `host/docker/<project>-dev-run/` in the
-  workstation `git-locks` store, with a lease longer than the timeout. The
-  second key follows the workstation registry rule
-  `host/docker/<exact-container-name>/`.
+Runs do not take a machine-wide lock. Several runs, including several of the
+same project and of the same worktree, run at the same time; section 5 says
+what they share. These rules bound how many run and give benchmarks the machine
+to themselves.
+
+- **Coordination is by file locks** (`flock`) in a per-user state directory:
+  `$DEVRUN_STATE_DIR`, else `$XDG_STATE_HOME/devrun`, else
+  `~/.local/state/devrun`, created with mode 0700 and refused when it belongs
+  to another user or others can write it. The kernel drops a file lock when its
+  process exits, however it exits, so a crash never leaves a stale lock. These
+  locks coordinate runs of the same user on one machine; they are not a security
+  boundary. No container can reach the state directory.
+- **A cap on command phases.** At most N command phases run at once (default
+  4; `--max-runs N` or `DEVRUN_MAX_RUNS`, 1 to 64). A run holds one of the slot
+  files `slot-0` to `slot-<N-1>` only while its command runs; preparation, copy-
+  in, the fetch phase, and exports do not take a slot. A run admitted with a
+  larger N can use slots that a run with a smaller N never looks at, so the cap
+  in force is the one each run was given. A waiting run prints one line when it
+  starts waiting and one every 30 seconds with the time waited so far, and gives
+  up after `--wait` seconds (default 3600), like any other wait in the runner.
+  The default suits the workstation's Docker VM (18 CPUs, about 16 GiB of
+  memory): 4 runs at the default `--cpus 4` use at most 16 CPUs. Memory is
+  overcommitted: 4 runs at the default `--memory 8g` could ask for 32 GiB, so
+  runs that all peak at once can still exhaust the VM. Lower the cap or the
+  memory limit for memory-heavy work.
+- **Exclusive runs for timing.** `--exclusive` waits until no other command
+  phase runs and keeps every other command phase out until it finishes.
+  **Performance measurements must use `--exclusive`**; a timing taken next to
+  other builds is not a measurement. Fetch phases and the preparation of other
+  runs can still happen during an exclusive run; they are short and mostly
+  input and output, not compilation. Once an exclusive run waits, new ordinary
+  runs queue behind it, so a stream of ordinary runs cannot starve it: an
+  ordinary run is admitted only by passing the `turnstile` file for an instant,
+  and a waiting exclusive run holds the turnstile until it finishes. Ordinary
+  runs hold `runs.lock` shared and an exclusive run holds it exclusively, so the
+  exclusive run starts only after every admitted ordinary run has finished.
+- **Fetch phases of a project take turns.** Cargo's package-cache lock is the
+  file `$CARGO_HOME/.package-cache`, and `CARGO_HOME` is on the read-only root:
+  cargo cannot open it, warns, and fetches without a lock. Two concurrent fetches
+  would write the same cache files, so the fetch phase holds the per-project
+  file lock `fetch-<project>.lock` while it runs.
+- **Run liveness.** Each run locks `runs/<run-id>.lock` before it creates any
+  Docker resource and keeps it locked until all of them are gone. The file also
+  records the project and the source key.
+- **`devrun --gc <project>`** removes, after printing each item (with
+  `--dry-run`, only prints):
+  - the stopped containers and the per-run volumes of dead runs. A run is dead
+    only when `--gc` can lock its liveness file itself, which proves that the
+    process has exited. Process ids can be reused and an age proves nothing
+    about use, so neither is used; `--gc` runs only when someone asks for it.
+    A run whose liveness file is missing (another user or another state
+    directory) is of unknown state and is left alone;
+  - iteration targets whose recorded worktree path no longer exists, when the
+    name, the source key, and the path labels agree and no live run uses that
+    source key.
+  It never removes a resource without this project's owner label or without a
+  valid run id or source label, a resource whose name does not match its
+  labels, a running container, a volume attached to any container that it is not
+  removing in the same pass, or the cargo caches. Docker itself refuses to
+  remove a running container or a volume in use, which backs these rules.
+- **git-locks, for visibility.** Each run registers its container under
+  `host/docker/<project>-dev-run-<run-id>/` in the workstation `git-locks` store,
+  with a lease longer than its timeouts and waits, and releases it at the end.
+  The key is unique, so runs never conflict over it; it keeps the workstation
+  registry rule `host/docker/<exact-container-name>/` true, and it keeps
+  daemon-wide maintenance, which claims `host/docker/`, from starting while runs
+  are active. A refusal (the key is covered by such a claim) makes the run wait.
+  A missing `git-locks`, a broken store, or a failed call prints one line and
+  the run goes on unregistered.
+- **CI.** With `CI=true` (a single-use CI machine) there are no slots, no
+  exclusive gate, no fetch lock, and no registration. The liveness file is still
+  written, so `--gc` works there too.
+- `scripts/build-image` and `tests/smoke-image` still claim `host/heavy-work`
+  and `host/docker/devcontainers-dev-run/`. `bin/devrun` no longer claims
+  either, so an image build and devrun command phases can run at the same time.
 
 ## 11. Not ours
 
 Resources without the `org.flyingrobots.owner` label belong to other projects.
-The tools never stop, remove, or prune them.
+The tools never stop, remove, or prune them. Resources with the owner label but
+without a run id or source label are not provably leftovers; `devrun --gc` never
+removes them either.

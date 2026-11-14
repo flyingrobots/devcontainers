@@ -6,9 +6,10 @@ containers, never on the host.
 
 - One base image per Rust toolchain, pinned to the version in each repository's
   `rust-toolchain.toml`.
-- One guarded runner that every repository calls. The runner claims `git-locks`
-  keys, applies a timeout and resource limits, mounts only named volumes (never
-  a host path), and audits Docker for litter before and after each run.
+- One guarded runner that every repository calls. The runner applies a timeout
+  and resource limits, mounts only named volumes (never a host path), gives each
+  run its own container and volumes, and lets several runs work at once under a
+  small cap.
 
 The rules are in [`docs/hygiene.md`](docs/hygiene.md). Work is tracked in GitHub
 Issues with `issue-dag/2` frontmatter.
@@ -55,15 +56,66 @@ bin/devrun ninelives ~/git/ninelives --worktree --export report.txt --export-pat
   `/scratch/out/` in the container) and `--export-patch` (a patch from the
   throwaway repository), into a fresh folder outside every repository
   (`--out DIR`, or a new temporary folder).
-- Each run holds the git-locks keys `host/heavy-work` and
-  `host/docker/<project>-dev-run/`, and removes only the container it created.
-  `--timeout` (default 1800 s) is shorter than the lease.
+- `--timeout` (default 1800 s) bounds each phase's command.
 - Not yet: the Docker litter audit, run receipts, free-space and volume budget
   checks (flyingrobots/devcontainers#5).
+
+### Concurrent runs
+
+Runs do not wait for each other unless the machine is full. The rules are in
+[`docs/hygiene.md`](docs/hygiene.md) sections 5 and 10.
+
+- Each run gets a run id and its own container (`<project>-dev-run-<id>`), copy
+  volume, and scratch volume, labelled with the run id, and removes them on
+  every exit path, including SIGTERM and SIGINT.
+- At most 4 command phases run at once on the machine. `--max-runs N` or
+  `DEVRUN_MAX_RUNS=N` sets the cap; a waiting run prints how long it has waited,
+  and gives up after `--wait SECONDS` (default 3600).
+- `--exclusive` waits until no other command phase runs and keeps them all out
+  until it finishes. Use it for every performance measurement:
+  `bin/devrun echo ~/git/echo --commit HEAD --exclusive -- cargo bench --locked`.
+- Fetch phases of one project take turns (cargo's own cache lock cannot work on
+  the read-only root).
+- With `CI=true` none of this coordination applies; CI machines run one job.
+- Runs register `host/docker/<project>-dev-run-<id>/` in the workstation
+  git-locks store for visibility; without git-locks they run unregistered.
+
+### Build output and disk
+
+The iteration build output lives in one volume per worktree,
+`<project>-target-<key>`, where the key is a hash of the worktree's real path.
+Each worktree keeps its own warm cache and never sees another worktree's
+artifacts. Two runs from the same worktree share it safely: cargo locks its build
+directory. The cost is disk: each target can grow to a full build of the
+workspace, so eight worktrees of a large workspace can hold several times the
+20 GiB per-project budget. `--evidence` builds into a new, empty volume that
+belongs to the one run and is removed with it.
+
+`--commit` runs give the copied files the current time, so an older commit never
+reuses output built from a newer one in the same worktree's target. `--worktree`
+runs keep the files' own times, like cargo on the host. A `--worktree` run after a
+`--commit` run of the same worktree can still reuse the commit's output for files
+that are older than that run (flyingrobots/devcontainers#9); touch the changed
+files, or use `--evidence`, when that matters.
+
+### Leftovers: `bin/devrun --gc`
+
+```sh
+bin/devrun --gc bunny --dry-run   # list what would be removed
+bin/devrun --gc bunny             # remove it
+```
+
+`--gc` removes the stopped containers and the volumes of runs that died without
+cleaning up (killed with SIGKILL, or a crash), and the targets of worktrees that
+no longer exist. A run counts as dead only when its liveness lock in the devrun
+state directory is free, which proves its process exited. `--gc` never removes a
+running container, a volume in use, the cargo caches, or anything without a
+valid run id or source label, such as the fixed-name volumes of older runner
+versions (remove those by hand once nothing uses them).
 
 Test it:
 
 ```sh
 bin/devrun devcontainers . --worktree -- python3 -m unittest discover -s tests   # unit tests, in a container
-tests/integration-devrun                                                            # real Docker
+tests/integration-devrun                                                            # real Docker, on the host
 ```
