@@ -605,6 +605,31 @@ class Liveness(GateCase):
         self.assertEqual(devrun.run_liveness(self.dir, RUN_ID), "dead")
         self.assertEqual(devrun.live_run_facts(self.dir), [])
 
+    def test_a_dead_run_stays_dead_while_another_probe_looks_at_it(self):
+        # Review of #13: two probes at once. The other probe holds its (shared) lock on the record.
+        devrun.RunRecord(self.dir, RUN_ID, {"project": "geordi"}).finish(clean=False)
+        other = os.open(str(self.dir / "runs" / f"{RUN_ID}.lock"), os.O_RDWR)
+        try:
+            devrun.fcntl.flock(other, devrun.fcntl.LOCK_SH | devrun.fcntl.LOCK_NB)
+            self.assertEqual(devrun.run_liveness(self.dir, RUN_ID), "dead")
+        finally:
+            os.close(other)
+
+    def test_concurrent_probes_of_a_dead_run_all_see_it_dead(self):
+        devrun.RunRecord(self.dir, RUN_ID, {"project": "geordi"}).finish(clean=False)
+        results, start = [], threading.Barrier(8)
+
+        def probe():
+            start.wait(LONG)
+            for _ in range(200):
+                results.append(devrun.run_liveness(self.dir, RUN_ID))
+        threads = [threading.Thread(target=probe) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(LONG)
+        self.assertEqual(set(results), {"dead"})
+
     def test_an_unknown_run_is_not_dead(self):
         self.assertEqual(devrun.run_liveness(self.dir, "aaaaaaaaaaaa"), "unknown")
 
@@ -1196,9 +1221,9 @@ class GcKeepsRecords(StateDirEnv):
 # --------------------------------------------------------------------------- #
 
 
-def survivor(name="geordi-dev-run-dddddddddddd", phase="command", mounts=(), project="geordi"):
+def survivor(name="geordi-dev-run-dddddddddddd", phase="command", mounts=(), project="geordi", exclusive=False):
     return {"id": "x", "name": name, "project": project, "run_id": "dddddddddddd", "phase": phase,
-            "timeout": "300", "started": "", "mounts": list(mounts)}
+            "timeout": "300", "started": "", "mounts": list(mounts), "exclusive": exclusive}
 
 
 class SurvivorAdmission(GateCase):
@@ -1215,6 +1240,16 @@ class SurvivorAdmission(GateCase):
         b.wait_attempts(3)
         self.assertFalse(b.admitted.is_set())
         self.assertTrue(any("geordi-dev-run-dddddddddddd" in m and "dead" in m for m in b.messages), b.messages)
+        left.clear()
+        self.admitted(b)
+
+    def test_an_exclusive_survivor_keeps_every_ordinary_run_out(self):
+        # Review of #13: a dead --exclusive runner's command still has the machine to itself.
+        left = [survivor(exclusive=True)]
+        b = self.contender(max_runs=4, survivors=lambda: list(left))
+        b.wait_attempts(3)
+        self.assertFalse(b.admitted.is_set())
+        self.assertTrue(any("geordi-dev-run-dddddddddddd" in m and "exclusive" in m for m in b.messages), b.messages)
         left.clear()
         self.admitted(b)
 
@@ -1275,10 +1310,13 @@ class SurvivorScan(StateDirEnv):
         self.ids = {}
 
     def run_container(self, rid, state, running=True, owner="geordi", name=None, timeout="300",
-                      started="2026-11-14T02:59:00.5Z", phase="command"):
+                      started="2026-11-14T02:59:00.5Z", phase="command", admission=None, record_admission=None):
         """A dev-run container of a run whose record is 'alive' (held by a child), 'dead', or 'unknown'."""
         if state == "dead":
-            devrun.RunRecord(self.dir, rid, {"project": owner}).finish(clean=False)
+            facts = {"project": owner}
+            if record_admission:
+                facts["admission"] = record_admission
+            devrun.RunRecord(self.dir, rid, facts).finish(clean=False)
         elif state == "alive":
             child = subprocess.Popen([sys.executable, "-c", HOLD_RECORD, str(ROOT / "bin" / "devrun"), str(self.dir), rid],
                                      stdout=subprocess.PIPE, stdin=subprocess.PIPE)
@@ -1294,6 +1332,8 @@ class SurvivorScan(StateDirEnv):
             lab[devrun.PHASE_LABEL] = phase
         if timeout is not None:
             lab[devrun.TIMEOUT_LABEL] = timeout
+        if admission is not None:
+            lab[devrun.ADMISSION_LABEL] = admission
         name = name or devrun.run_resource_names(owner, rid)["container"]
         self.ids[rid] = self.daemon.add_container(name, lab, running=running, started=started)
         return name
@@ -1309,6 +1349,14 @@ class SurvivorScan(StateDirEnv):
         found = devrun.Survivors(self.dir, report=lambda m: None)()
         self.assertEqual([s["name"] for s in found], [dead])
         self.assertEqual(found[0]["phase"], "command")
+
+    def test_a_survivor_is_exclusive_by_its_label_or_by_its_record(self):
+        self.run_container("d00000000001", "dead", admission="exclusive")
+        self.run_container("d00000000002", "dead", admission=None, record_admission="exclusive")
+        self.run_container("d00000000003", "dead", admission="ordinary")
+        self.run_container("d00000000004", "dead", admission=None)
+        found = {s["run_id"]: s["exclusive"] for s in devrun.Survivors(self.dir, report=lambda m: None)()}
+        self.assertEqual(found, {"d00000000001": True, "d00000000002": True, "d00000000003": False, "d00000000004": False})
 
     def test_a_survivor_past_its_own_timeout_is_stopped_and_no_other_container(self):
         overdue = self.run_container("d00000000001", "dead", timeout="60", started="2026-11-14T02:58:59.9Z")
@@ -1457,6 +1505,22 @@ class RunUnderSignal(StateDirEnv):
         self.assertEqual(seen, {"exclusive admitted while the container existed": False})
         self.assertEqual(self.daemon.containers, {})
         devrun.Gate(self.dir, 1).admit(True, 0).release()  # and released after it
+
+    def test_the_admission_mode_is_on_the_command_container_and_in_the_record(self):
+        seen = []
+
+        def start(cmd):
+            if self.is_command(cmd):
+                c = self.daemon.containers[self.daemon.by_ref(cmd[-1])]
+                rid = c["labels"][devrun.RUN_ID_LABEL]
+                record = json.loads((self.dir / "runs" / f"{rid}.lock").read_text())
+                seen.append((c["labels"].get(devrun.ADMISSION_LABEL), record.get("admission")))
+        self.daemon.hooks[("docker", "start")] = start
+        for mode in (["--worktree", "--exclusive"], ["--worktree"]):
+            code, err = self.main(*mode)
+            self.assertEqual(code, 0, err)
+            self.out.rmdir()
+        self.assertEqual(seen, [("exclusive", "exclusive"), ("ordinary", "ordinary")])
 
     def test_a_pinned_run_holds_its_targets_lock_while_the_command_runs_and_a_worktree_run_does_not(self):
         lock = f"pinned-geordi-{self.key}.lock"

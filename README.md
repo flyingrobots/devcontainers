@@ -73,7 +73,8 @@ Runs do not wait for each other unless the machine is full. The rules are in
   and gives up after `--wait SECONDS` (default 3600). A run keeps its slot until
   its container has stopped.
 - A command container whose runner was killed (SIGKILL) keeps counting against
-  the cap, and `--exclusive` runs wait for it, until it ends. Once its own
+  the cap, and `--exclusive` runs wait for it, until it ends; one from an
+  `--exclusive` run keeps every other run out. Once its own
   `--timeout` has passed, the next run that waits for it (or `--gc`) stops it;
   nothing stops it earlier.
 - `--exclusive` waits until no other command phase runs and keeps them all out

@@ -134,7 +134,7 @@ symlinks resolved), so each git worktree has its own key.
 | --- | --- | --- | --- |
 | Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` | Until a new toolchain replaces it |
 | Upstream base, the build input | `rust@sha256:<digest>` from `images/rust-dev/base-digests`, pulled by digest. It carries only upstream labels. Keep it while its digest line exists; after removing the line, remove it with `docker image rm`. | none (upstream image) | As left |
-| Run container | `<project>-dev-run-<run-id>`, also labelled with the run id, `org.flyingrobots.phase=<prep\|copy\|fetch\|command>`, and `org.flyingrobots.timeout=<seconds>` (section 10 uses both when its runner has died) | `dev-run` | One run; removed by the run |
+| Run container | `<project>-dev-run-<run-id>`, also labelled with the run id, `org.flyingrobots.phase=<prep\|copy\|fetch\|command>`, `org.flyingrobots.timeout=<seconds>`, and on the command container `org.flyingrobots.admission=<ordinary\|exclusive>` (section 10 uses them when its runner has died) | `dev-run` | One run; removed by the run |
 | Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` | Kept |
 | Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` | Kept |
 | Build output, `--worktree` runs | `<project>-target-<source-key>`, also labelled `org.flyingrobots.source-path=<real path>` and `org.flyingrobots.source-key=<source-key>` (one per worktree) | `target` | Kept; `devrun --gc` removes it once the worktree path no longer exists |
@@ -286,7 +286,9 @@ to themselves.
   removed it; a timeout, a signal, or an error in between does not release the
   slot earlier. Preparation, copy-in, the fetch phase, and exports do not take a
   slot. A survivor (below) in its command phase counts as a held slot: a run is
-  admitted only when the free slots outnumber the survivors. A run admitted with a
+  admitted only when the free slots outnumber the survivors. A survivor of an
+  exclusive run keeps every ordinary run out until it stops, as its runner
+  would have. A run admitted with a
   larger N can use slots that a run with a smaller N never looks at, so the cap
   in force is the one each run was given. A waiting run prints one line when it
   starts waiting and one every 30 seconds with the time waited so far, and gives
@@ -324,7 +326,8 @@ to themselves.
   says what this guarantees.
 - **Survivors.** A survivor is a running container that carries the role
   `dev-run`, a valid owner and run id, and a name that matches them, and whose
-  run's liveness file in this state directory is free: its runner is dead.
+  run's liveness file in this state directory is free: its runner is dead. It is
+  exclusive when its admission label or its run's record says so.
   Admission, the fetch lock, and the pinned lock find survivors by these labels
   with `docker ps` and `docker inspect`, but only once the file locks would admit
   the run. A container of a run in another state directory, or of a live run, is
@@ -343,9 +346,12 @@ to themselves.
   file during the same exit, and a run that passes the turnstile in that instant
   can see the slot free and the runner still alive, and so start one run over
   the cap.
-- **Run liveness.** Each run locks `runs/<run-id>.lock` before it creates any
-  Docker resource and keeps it locked until all of them are gone. The file also
-  records the project and the source key.
+- **Run liveness.** Each run locks `runs/<run-id>.lock` exclusively before it
+  creates any Docker resource and keeps it locked until all of them are gone.
+  The file also records the project, the source key, and the admission mode
+  (`ordinary` or `exclusive`). A probe takes a shared lock without waiting: it
+  fails only while the run holds its exclusive lock, so two probes of a dead
+  run's record at the same moment both read it as dead.
 - **`devrun --gc <project>`** removes, after printing each item (with
   `--dry-run`, only prints):
   - the stopped containers and the per-run volumes of dead runs. A run is dead

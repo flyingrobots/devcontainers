@@ -24,6 +24,11 @@ version numbers yet, so changes are listed under Unreleased.
   Once its own timeout has passed, a waiting run or `--gc` stops it. Run
   containers carry two new labels for this, `org.flyingrobots.phase` and
   `org.flyingrobots.timeout`.
+- A surviving command of a killed `--exclusive` run keeps every ordinary run out
+  until it stops; it no longer counts as one slot. The command container is
+  labelled `org.flyingrobots.admission` and the run record keeps the mode.
+- A liveness probe takes a shared lock, so two probes of a dead run's record at
+  the same moment no longer make one of them read the run as alive.
 - A run keeps its slot, the exclusive gate, the fetch lock, and the pinned lock
   until Docker confirms that its container has stopped or it has been removed;
   on SIGTERM they were released before cleanup had removed the container.

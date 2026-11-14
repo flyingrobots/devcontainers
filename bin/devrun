@@ -51,6 +51,7 @@ SOURCE_PATH_LABEL = "org.flyingrobots.source-path"
 SOURCE_KEY_LABEL = "org.flyingrobots.source-key"
 PHASE_LABEL = "org.flyingrobots.phase"
 TIMEOUT_LABEL = "org.flyingrobots.timeout"
+ADMISSION_LABEL = "org.flyingrobots.admission"
 RUN_ID_RE = re.compile(r"[0-9a-f]{12}")
 SOURCE_KEY_RE = re.compile(r"[0-9a-f]{16}")
 LOCK_STORE = "/Users/Shared/git-locks/workstation.git"
@@ -625,9 +626,14 @@ class Gate:
                         # the turnstile one at a time, so no other run takes a slot meanwhile.
                         got = [fd for fd in slots if _try_lock(fd, fcntl.LOCK_EX)]
                         left = [s for s in self.survivors() if counts_as_command(s)] if got else []
-                        if len(got) <= len(left):
+                        alone = [s for s in left if s.get("exclusive")]
+                        if alone:
+                            w.because(f"a run slot (the runner of {survivor_names(alone)}, an exclusive run, "
+                                      f"is dead but its command still runs and keeps the machine to itself)")
+                        elif len(got) <= len(left):
                             w.because(f"a run slot (at most {self.max_runs} at once; the runner of "
                                       f"{survivor_names(left)} is dead but its command still runs)" if left else plain)
+                        if alone or len(got) <= len(left):
                             for fd in got:
                                 fcntl.flock(fd, fcntl.LOCK_UN)
                             got = []
@@ -710,7 +716,9 @@ def run_liveness(directory: Path, run_id: str) -> str:
     except FileNotFoundError:
         return "unknown"
     try:
-        if not _try_lock(fd, fcntl.LOCK_EX):
+        # A shared lock: the run itself holds the record exclusively for as long as it lives, so a
+        # live run still reads 'alive', and two probes of a dead run's record never see each other.
+        if not _try_lock(fd, fcntl.LOCK_SH):
             return "alive"
         held = os.fstat(fd)
         try:
@@ -791,10 +799,19 @@ class Survivors:
             if run_liveness(self.directory, rid) != "dead":
                 continue
             found.append({"id": d["Id"], "name": name, "project": project, "run_id": rid,
+                          "exclusive": labels.get(ADMISSION_LABEL) == "exclusive" or self._recorded_exclusive(rid),
                           "phase": labels.get(PHASE_LABEL), "timeout": labels.get(TIMEOUT_LABEL),
                           "started": d["State"].get("StartedAt") or "",
                           "mounts": [m.get("Name") for m in d.get("Mounts") or [] if m.get("Type") == "volume"]})
         return found
+
+    def _recorded_exclusive(self, run_id: str) -> bool:
+        """Whether the dead run's record says it asked for exclusive admission."""
+        try:
+            facts = json_loads((self.directory / "runs" / f"{run_id}.lock").read_text())
+        except (OSError, ValueError):
+            return False
+        return isinstance(facts, dict) and facts.get("admission") == "exclusive"
 
     def deadline(self, survivor: dict) -> Optional[float]:
         """When the survivor's own timeout ends, by the daemon's clock; None without a timeout label."""
@@ -958,13 +975,15 @@ class Docker:
         return name
 
     def create(self, cmd: List[str], network: bool, target_volume: str, env: Optional[dict] = None,
-               caches_writable: bool = False, phase: str = "command", timeout: int = 300) -> None:
+               caches_writable: bool = False, phase: str = "command", timeout: int = 300,
+               admission: Optional[str] = None) -> None:
         """Create the run container. The cargo caches are writable only in the fetch phase. The
         phase and the timeout are labels, so that another run can recognize a container whose
         runner died and enforce its timeout (Survivors)."""
         ro = "" if caches_writable else ",readonly"
         args = ["docker", "create", "--name", self.name,
-                *self.labels("dev-run", {PHASE_LABEL: phase, TIMEOUT_LABEL: str(timeout)}),
+                *self.labels("dev-run", {PHASE_LABEL: phase, TIMEOUT_LABEL: str(timeout),
+                                         **({ADMISSION_LABEL: admission} if admission else {})}),
                 "--user", f"{UID}:{GID}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,mode=1777",
                 "--pids-limit", "4096", "--memory", self.memory, "--memory-swap", self.memory, "--cpus", self.cpus,
@@ -1404,7 +1423,9 @@ def main_inner(ns: argparse.Namespace) -> int:
     coordinated = os.environ.get("CI") != "true"
     directory = state_dir()
     gate = Gate(directory, ns.max_runs, survivors=Survivors(directory))
-    record = RunRecord(directory, run_id, {"project": ns.project, "source_key": key, "pid": str(os.getpid())})
+    admission_mode = "exclusive" if ns.exclusive else "ordinary"
+    record = RunRecord(directory, run_id, {"project": ns.project, "source_key": key, "pid": str(os.getpid()),
+                                           "admission": admission_mode})
     lease = Lease(f"devrun-{ns.project}-{run_id}", f"devrun-{run_id}", f"host/docker/{docker.name}/",
                   2 * ns.timeout + 2 * ns.wait + 1500, f"devrun {ns.project} run {run_id}")
     work = Path(tempfile.mkdtemp(prefix="devrun-src-"))
@@ -1478,7 +1499,9 @@ def main_inner(ns: argparse.Namespace) -> int:
         cmd = ["bash", "-c", INNER_SCRIPT, "run", mode, "1" if ns.export_patch else "0", *ns.command]
         env["CARGO_NET_OFFLINE"] = "false" if ns.network else "true"
         env["DEVRUN_FRESH_MTIMES"] = "1" if mode == "commit" else "0"
-        docker.create(cmd, ns.network, target_volume, env, timeout=ns.timeout)
+        # The admission mode is a label and in the record, so that if this runner dies, other runs
+        # know that its surviving command had the machine to itself.
+        docker.create(cmd, ns.network, target_volume, env, timeout=ns.timeout, admission=admission_mode)
         # The pinned-target lock comes first and admission second: a run never holds a slot or the
         # exclusive gate while it waits for another run of its worktree. Both stay held until the
         # container is confirmed stopped or removed (Docker.start, Docker.remove).

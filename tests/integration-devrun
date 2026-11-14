@@ -345,6 +345,23 @@ survivor_end="$(finished "$survivor")"
 before "$survivor_end" "$(field start "$work/o.out")" || fail "the ordinary run started before the survivor ended"
 before "$survivor_end" "$(field start "$work/x.out")" || fail "the exclusive run started before the survivor ended"
 
+echo "== SIGKILL of an exclusive run: its surviving command still keeps ordinary runs out (review of #13)"
+# The cap is the default 4, so only the exclusive mode, not the slot count, can keep the ordinary run out.
+spawn "$project" "$repo" --worktree "${small[@]}" --exclusive -- bash -c "$timed" timed 15 >"$work/es.out" 2>"$work/es.err" & pes=$!
+pids=("$pes")
+wait_for 120 "the exclusive run's command to start" has_line '^start ' "$work/es.out"
+erid="$(run_id_of "$work/es.err")"; esurvivor="$project-dev-run-$erid"
+kill -KILL "$pes"
+wait "$pes" 2>/dev/null || true
+running "$esurvivor" || fail "the exclusive run's container did not survive its runner"
+spawn "$project" "$work/wt2" --worktree "${small[@]}" -- bash -c "$timed" timed 1 >"$work/eo.out" 2>"$work/eo.err" & peo=$!
+pids=("$peo")
+wait_for 120 "the ordinary run to wait or start" waits_or_starts "runner of $esurvivor, an exclusive run," "$work/eo.err" "$work/eo.out"
+if has_line '^start ' "$work/eo.out" && running "$esurvivor"; then fail "an ordinary run started beside a dead exclusive run's command"; fi
+wait "$peo" || fail "the ordinary run failed: $(cat "$work/eo.err")"
+pids=()
+before "$(finished "$esurvivor")" "$(field start "$work/eo.out")" || fail "the ordinary run started before the exclusive survivor ended"
+
 echo "== a survivor past its own timeout is stopped by the run that waits for it, and by nothing earlier"
 spawn "$project" "$repo" --worktree "${small[@]}" --timeout 12 -- bash -c "$timed" timed 300 >"$work/v.out" 2>"$work/v.err" & pv=$!
 pids=("$pv")
@@ -364,7 +381,7 @@ before 12 "$lived" || fail "the survivor was stopped after $lived s, before its 
 before 60 "$lived" && fail "the survivor lived $lived s: nothing stopped it at its 12 s timeout"
 before "$overdue_end" "$(field start "$work/y.out")" || fail "the exclusive run started before the survivor stopped"
 env DEVRUN_STATE_DIR="$private" "$devrun" --gc "$project" >"$work/gc4.out" || fail "gc failed: $(cat "$work/gc4.out")"
-for r in "$srid" "$vrid"; do
+for r in "$srid" "$erid" "$vrid"; do
   [[ -z "$(leftovers_of "$r")" ]] || fail "gc left resources of dead run $r: $(leftovers_of "$r")"
 done
 
