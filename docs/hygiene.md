@@ -134,10 +134,11 @@ symlinks resolved), so each git worktree has its own key.
 | --- | --- | --- | --- |
 | Base image | `flyingrobots/rust-dev:<rust-version>` | `base-image` | Until a new toolchain replaces it |
 | Upstream base, the build input | `rust@sha256:<digest>` from `images/rust-dev/base-digests`, pulled by digest. It carries only upstream labels. Keep it while its digest line exists; after removing the line, remove it with `docker image rm`. | none (upstream image) | As left |
-| Run container | `<project>-dev-run-<run-id>`, also labelled with the run id | `dev-run` | One run; removed by the run |
+| Run container | `<project>-dev-run-<run-id>`, also labelled with the run id, `org.flyingrobots.phase=<prep\|copy\|fetch\|command>`, `org.flyingrobots.timeout=<seconds>`, and on the command container `org.flyingrobots.admission=<ordinary\|exclusive>` (section 10 uses them when its runner has died) | `dev-run` | One run; removed by the run |
 | Cargo registry cache, at `/usr/local/cargo/registry` | `<project>-cargo-registry` (per project: no cross-project cache poisoning) | `cargo-registry` | Kept |
 | Cargo git cache, at `/usr/local/cargo/git` | `<project>-cargo-git` | `cargo-git` | Kept |
-| Build output, iteration | `<project>-target-<source-key>`, also labelled `org.flyingrobots.source-path=<real path>` and `org.flyingrobots.source-key=<source-key>` (one per worktree) | `target` | Kept; `devrun --gc` removes it once the worktree path no longer exists |
+| Build output, `--worktree` runs | `<project>-target-<source-key>`, also labelled `org.flyingrobots.source-path=<real path>` and `org.flyingrobots.source-key=<source-key>` (one per worktree) | `target` | Kept; `devrun --gc` removes it once the worktree path no longer exists |
+| Build output, pinned runs (`--commit`, `--history`) | `<project>-target-pinned-<source-key>`, with the same source labels (one per worktree) | `target-pinned` | Kept; `devrun --gc` removes it once the worktree path no longer exists |
 | Build output, evidence | `<project>-target-evidence-<run-id>`, new and empty for each `--evidence` run, also labelled with the run id | `target-evidence` | One run; removed by the run |
 | The copy, at `/work` | `<project>-work-<run-id>`, also labelled with the run id | `work` | One run; removed by the run |
 | Inputs, logs, test data, exports, at `/scratch` | `<project>-scratch-<run-id>`, also labelled with the run id | `scratch` | One run; removed by the run |
@@ -149,6 +150,23 @@ symlinks resolved), so each git worktree has its own key.
 - **Evidence runs use a fresh target.** A merge-gate run never reuses build
   output, so a stale cache cannot fabricate a passing result. The evidence target
   belongs to the one run, so concurrent evidence runs never share one.
+- **What a pinned run guarantees about its build.** A `--commit` or `--history`
+  run without `--evidence` builds into its worktree's pinned target, which
+  `--worktree` runs never use. It takes that target's lock (section 10) before its
+  command container starts and keeps it until the container has stopped. Inside
+  the container the copy gets the current time (`--commit`) or is checked out
+  then (`--history`), so every source file is newer than any build output already
+  in the target: cargo rebuilds the workspace's own crates from this run's copy
+  and reuses only registry and git dependencies, which it identifies by version
+  and checksum rather than by time. No other run can write the target between the
+  time refresh and the end of the command, so the result does not depend on what
+  else runs. Limits: the command itself can still change the copy before it
+  builds, a build script can leave files in the target that a later pinned run
+  reads (the target is still not evidence), and with `CI=true` there is no lock,
+  which is safe only because a CI machine runs one job. The cost is a second
+  target per worktree that runs both modes, and pinned runs of one worktree run
+  their command phases one at a time; runs from different worktrees, and
+  `--worktree` runs, are not delayed.
 - A run refuses a shared volume (a cache or a target) that exists with other
   labels: another owner, another role, or, for a target, another source path or
   key. It refuses a per-run volume or a container that already exists under its
@@ -173,14 +191,20 @@ project share only these, and each sharing has a reason:
   write. This is cargo's design and is not tested here. The writer still runs no
   repository-chosen code, so the poisoning rule above holds as before; what is
   new is only that a read and a write can happen at the same moment.
-- **The iteration target of one worktree**, read-write, when two runs come from
-  the same worktree at once. Cargo's build-directory lock (`.cargo-lock` in the
-  target, a file lock that works across containers on one Docker volume)
-  serializes cargo's own builds in it; cargo prints "Blocking waiting for file
-  lock on build directory". A command that writes `/target` without cargo is not
-  serialized. One run's build scripts can change what the other run builds from,
-  which was already true of consecutive runs: the iteration target is never
-  evidence. Runs from different worktrees never share a target.
+- **The `--worktree` target of one worktree**, read-write, when two
+  `--worktree` runs come from the same worktree at once. Cargo's build-directory
+  lock (`.cargo-lock` in the target, a file lock that works across containers on
+  one Docker volume) serializes cargo's own builds in it; cargo prints "Blocking
+  waiting for file lock on build directory". A command that writes `/target`
+  without cargo is not serialized. One run's build scripts can change what the
+  other run builds from, which was already true of consecutive runs: the
+  iteration target is never evidence. `--worktree` runs keep the files' own
+  times, so if a file is edited between the copies of two such runs, the run with
+  the older copy can reuse the other's build of the newer content; the same is
+  true of cargo on the host.
+- **The pinned target of one worktree**, never at the same time: pinned runs of
+  one worktree take turns on its lock for their whole command phase (above).
+  Runs from different worktrees never share a target.
 
 ## 6. Outputs
 
@@ -199,19 +223,26 @@ project share only these, and each sharing has a reason:
   timeout, and SIGTERM or SIGINT. After the first signal, further signals are
   ignored, so they cannot cut cleanup short. Cleanup removes only what this run
   created; the run's own records say what that is.
+- A run records that a container or volume may exist before it asks Docker to
+  create it. When a signal interrupts a create, cleanup lists this run's labelled
+  resources to decide: one that exists is removed, one that does not was never
+  created. When Docker cannot answer, the run keeps its liveness record, so
+  `--gc` can still find the run. A signal that arrives during cleanup is ignored.
 - A run that is killed outright (SIGKILL, a host crash) cannot clean up. Its
   resources stay, labelled with its run id, and `devrun --gc <project>` removes
-  them (section 10). Its container may keep running until its command ends,
-  because the timeout lives in the killed process; `--gc` leaves a running
-  container alone and says so.
+  them (section 10). Its container may keep running, because the timeout lived
+  in the killed process. Until it stops it still counts against the run cap and
+  keeps exclusive runs out, and once its own timeout has passed a waiting run or
+  `--gc` stops it (section 10, "Survivors").
 - The command runs under a timeout that is shorter than the `git-locks` lease.
 
 ## 8. Budgets and free space
 
 - Build output: at most 20 GiB per project. Logs and test data: at most 4 GiB,
   including at most 128 MiB of logs.
-- The build output of a project is the sum over its iteration targets, one per
-  worktree, plus the evidence targets of the runs in progress. Each target can
+- The build output of a project is the sum over its kept targets, up to two per
+  worktree (one for `--worktree` runs, one for pinned runs), plus the evidence
+  targets of the runs in progress. Each target can
   reach the size of a full debug build of the workspace, so a handful of
   worktrees, or a few concurrent evidence runs, can exceed 20 GiB, which a
   single per-project target could not. Until the measurement exists, remove the
@@ -250,8 +281,14 @@ to themselves.
   boundary. No container can reach the state directory.
 - **A cap on command phases.** At most N command phases run at once (default
   4; `--max-runs N` or `DEVRUN_MAX_RUNS`, 1 to 64). A run holds one of the slot
-  files `slot-0` to `slot-<N-1>` only while its command runs; preparation, copy-
-  in, the fetch phase, and exports do not take a slot. A run admitted with a
+  files `slot-0` to `slot-<N-1>` from just before its command container starts
+  until Docker confirms that the container has stopped, or until the run has
+  removed it; a timeout, a signal, or an error in between does not release the
+  slot earlier. Preparation, copy-in, the fetch phase, and exports do not take a
+  slot. A survivor (below) in its command phase counts as a held slot: a run is
+  admitted only when the free slots outnumber the survivors. A survivor of an
+  exclusive run keeps every ordinary run out until it stops, as its runner
+  would have. A run admitted with a
   larger N can use slots that a run with a smaller N never looks at, so the cap
   in force is the one each run was given. A waiting run prints one line when it
   starts waiting and one every 30 seconds with the time waited so far, and gives
@@ -271,15 +308,50 @@ to themselves.
   ordinary run is admitted only by passing the `turnstile` file for an instant,
   and a waiting exclusive run holds the turnstile until it finishes. Ordinary
   runs hold `runs.lock` shared and an exclusive run holds it exclusively, so the
-  exclusive run starts only after every admitted ordinary run has finished.
+  exclusive run starts only after every admitted ordinary run has finished, and
+  then waits until no survivor is in its command phase, saying which container
+  it waits for; `--wait` bounds the whole wait.
 - **Fetch phases of a project take turns.** Cargo's package-cache lock is the
   file `$CARGO_HOME/.package-cache`, and `CARGO_HOME` is on the read-only root:
   cargo cannot open it, warns, and fetches without a lock. Two concurrent fetches
   would write the same cache files, so the fetch phase holds the per-project
-  file lock `fetch-<project>.lock` while it runs.
-- **Run liveness.** Each run locks `runs/<run-id>.lock` before it creates any
-  Docker resource and keeps it locked until all of them are gone. The file also
-  records the project and the source key.
+  file lock `fetch-<project>.lock` until its container has stopped or been
+  removed, and does not take it while a survivor of the same project is fetching.
+- **Pinned runs of a worktree take turns.** A `--commit` or `--history` run
+  without `--evidence` holds `pinned-<project>-<source-key>.lock` from before its
+  command container starts until that container has stopped or been removed, and
+  does not take it while a survivor's command container uses the same pinned
+  target. It takes this lock before it asks for a slot, so it never holds a slot
+  or the exclusive gate while it waits for another run of its worktree. Section 5
+  says what this guarantees.
+- **Survivors.** A survivor is a running container that carries the role
+  `dev-run`, a valid owner and run id, and a name that matches them, and whose
+  run's liveness file in this state directory is free: its runner is dead. It is
+  exclusive when its admission label or its run's record says so.
+  Admission, the fetch lock, and the pinned lock find survivors by these labels
+  with `docker ps` and `docker inspect`, but only once the file locks would admit
+  the run. A container of a run in another state directory, or of a live run, is
+  never a survivor. A survivor's timeout died with its runner, so nothing bounds it any
+  more. The rule: a waiting run, or `--gc`, stops (`docker kill`, then `docker
+  wait`) a survivor once its own timeout has passed, which is what its runner would
+  have done. The deadline is the container's `State.StartedAt` plus its
+  `org.flyingrobots.timeout` label, compared with the daemon's current time
+  (`docker info`), so host clock skew plays no part. Nothing stops a survivor
+  before its timeout, or a survivor without the timeout label (from an older
+  runner): those are waited for, and can be stopped by hand with `docker stop`.
+  Nothing else is ever stopped. A run whose cleanup cannot remove its container
+  unlocks its liveness file first and its slot and other locks after, so the
+  container counts as a survivor from the moment the locks are free. One gap is
+  left: when a runner is killed, the kernel releases its slot and its liveness
+  file during the same exit, and a run that passes the turnstile in that instant
+  can see the slot free and the runner still alive, and so start one run over
+  the cap.
+- **Run liveness.** Each run locks `runs/<run-id>.lock` exclusively before it
+  creates any Docker resource and keeps it locked until all of them are gone.
+  The file also records the project, the source key, and the admission mode
+  (`ordinary` or `exclusive`). A probe takes a shared lock without waiting: it
+  fails only while the run holds its exclusive lock, so two probes of a dead
+  run's record at the same moment both read it as dead.
 - **`devrun --gc <project>`** removes, after printing each item (with
   `--dry-run`, only prints):
   - the stopped containers and the per-run volumes of dead runs. A run is dead
@@ -288,9 +360,16 @@ to themselves.
     about use, so neither is used; `--gc` runs only when someone asks for it.
     A run whose liveness file is missing (another user or another state
     directory) is of unknown state and is left alone;
-  - iteration targets whose recorded worktree path no longer exists, when the
-    name, the source key, and the path labels agree and no live run uses that
-    source key.
+  - worktree and pinned targets whose recorded worktree path no longer exists,
+    when the role, the name, the source key, and the path labels agree and no
+    live run uses that source key.
+  Before it decides, it stops the project's survivors whose own timeout has
+  passed (with `--dry-run` it only names them); a survivor within its timeout is
+  kept and named. After removing, it forgets the liveness file of a dead run only
+  when nothing labelled with that run id is left. When `docker inspect` fails, it
+  accepts the failure only if every resource missing from the output is also
+  missing from a fresh listing; otherwise it stops with an error and forgets
+  nothing, so a resource that still exists is never taken for an absent one.
   It never removes a resource without this project's owner label or without a
   valid run id or source label, a resource whose name does not match its
   labels, a running container, a volume attached to any container that it is not

@@ -70,33 +70,45 @@ Runs do not wait for each other unless the machine is full. The rules are in
   every exit path, including SIGTERM and SIGINT.
 - At most 4 command phases run at once on the machine. `--max-runs N` or
   `DEVRUN_MAX_RUNS=N` sets the cap; a waiting run prints how long it has waited,
-  and gives up after `--wait SECONDS` (default 3600).
+  and gives up after `--wait SECONDS` (default 3600). A run keeps its slot until
+  its container has stopped.
+- A command container whose runner was killed (SIGKILL) keeps counting against
+  the cap, and `--exclusive` runs wait for it, until it ends; one from an
+  `--exclusive` run keeps every other run out. Once its own
+  `--timeout` has passed, the next run that waits for it (or `--gc`) stops it;
+  nothing stops it earlier.
 - `--exclusive` waits until no other command phase runs and keeps them all out
   until it finishes. Use it for every performance measurement:
   `bin/devrun echo ~/git/echo --commit HEAD --exclusive -- cargo bench --locked`.
 - Fetch phases of one project take turns (cargo's own cache lock cannot work on
   the read-only root).
+- `--commit` and `--history` runs of one worktree take turns on that worktree's
+  pinned build target (below).
 - With `CI=true` none of this coordination applies; CI machines run one job.
 - Runs register `host/docker/<project>-dev-run-<id>/` in the workstation
   git-locks store for visibility; without git-locks they run unregistered.
 
 ### Build output and disk
 
-The iteration build output lives in one volume per worktree,
-`<project>-target-<key>`, where the key is a hash of the worktree's real path.
-Each worktree keeps its own warm cache and never sees another worktree's
-artifacts. Two runs from the same worktree share it safely: cargo locks its build
-directory. The cost is disk: each target can grow to a full build of the
-workspace, so eight worktrees of a large workspace can hold several times the
-20 GiB per-project budget. `--evidence` builds into a new, empty volume that
-belongs to the one run and is removed with it.
+Build output lives in kept volumes per worktree, keyed by a hash of the
+worktree's real path: `<project>-target-<key>` for `--worktree` runs and
+`<project>-target-pinned-<key>` for `--commit` and `--history` runs. Each
+worktree keeps its own warm caches and never sees another worktree's artifacts.
+Two `--worktree` runs from the same worktree share their target safely: cargo
+locks its build directory. The cost is disk: each target can grow to a full
+build of the workspace, so eight worktrees of a large workspace can hold several
+times the 20 GiB per-project budget. `--evidence` builds into a new, empty volume
+that belongs to the one run and is removed with it.
 
-`--commit` runs give the copied files the current time, so an older commit never
-reuses output built from a newer one in the same worktree's target. `--worktree`
-runs keep the files' own times, like cargo on the host. A `--worktree` run after a
-`--commit` run of the same worktree can still reuse the commit's output for files
-that are older than that run (flyingrobots/devcontainers#9); touch the changed
-files, or use `--evidence`, when that matters.
+A pinned run's result does not depend on what else runs: its copy gets the
+current time (`--commit`) or is checked out in the container (`--history`), and
+no other run can build in the pinned target until its command has ended, so
+cargo rebuilds the workspace's crates from this run's source and reuses only
+registry and git dependencies. Pinned runs of one worktree therefore run their
+commands one at a time. `--worktree` runs keep the files' own times, like cargo
+on the host, and never see a pinned run's output; a tool that restores old
+modification times can still make them reuse stale output
+(flyingrobots/devcontainers#9).
 
 ### Leftovers: `bin/devrun --gc`
 
@@ -108,10 +120,13 @@ bin/devrun --gc bunny             # remove it
 `--gc` removes the stopped containers and the volumes of runs that died without
 cleaning up (killed with SIGKILL, or a crash), and the targets of worktrees that
 no longer exist. A run counts as dead only when its liveness lock in the devrun
-state directory is free, which proves its process exited. `--gc` never removes a
-running container, a volume in use, the cargo caches, or anything without a
-valid run id or source label, such as the fixed-name volumes of older runner
-versions (remove those by hand once nothing uses them).
+state directory is free, which proves its process exited. A dead run's container
+that is still running is stopped first if its own timeout has passed, and kept
+otherwise. `--gc` never removes a running container, a volume in use, the cargo
+caches, or anything without a valid run id or source label, such as the
+fixed-name volumes of older runner versions (remove those by hand once nothing
+uses them). If Docker cannot inspect a resource that still exists, `--gc` stops
+with an error and forgets no run.
 
 Test it:
 

@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import fcntl
 import hashlib
 import io
@@ -48,6 +49,9 @@ SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 RUN_ID_LABEL = "org.flyingrobots.run-id"
 SOURCE_PATH_LABEL = "org.flyingrobots.source-path"
 SOURCE_KEY_LABEL = "org.flyingrobots.source-key"
+PHASE_LABEL = "org.flyingrobots.phase"
+TIMEOUT_LABEL = "org.flyingrobots.timeout"
+ADMISSION_LABEL = "org.flyingrobots.admission"
 RUN_ID_RE = re.compile(r"[0-9a-f]{12}")
 SOURCE_KEY_RE = re.compile(r"[0-9a-f]{16}")
 LOCK_STORE = "/Users/Shared/git-locks/workstation.git"
@@ -59,6 +63,8 @@ MAX_RUNS_LIMIT = 64
 DEFAULT_WAIT = 3600
 # Roles of the volumes that belong to one run and are removed by it (docs/hygiene.md section 5).
 PER_RUN_ROLES = ("work", "scratch", "target-evidence")
+# Roles of the build targets kept per worktree: one for --worktree runs, one for pinned runs.
+TARGET_ROLES = ("target", "target-pinned")
 
 
 class DevrunError(Exception):
@@ -414,8 +420,11 @@ def source_key(top: str) -> str:
     return hashlib.sha256(os.fsencode(top)).hexdigest()[:16]
 
 
-def target_volume_name(project: str, key: str) -> str:
-    """The iteration target of one source tree (one git worktree)."""
+def target_volume_name(project: str, key: str, role: str = "target") -> str:
+    """A kept build target of one source tree (one git worktree): role "target" for --worktree
+    runs, "target-pinned" for --commit and --history runs (docs/hygiene.md section 5)."""
+    if role == "target-pinned":
+        return f"{project}-target-pinned-{key}"
     return f"{project}-target-{key}"
 
 
@@ -489,6 +498,12 @@ class Waiter:
         self.start = clock()
         self.next_report = self.start
 
+    def because(self, what: str) -> None:
+        """Change what the wait is for; a new reason is reported at the next poll."""
+        if what != self.what:
+            self.what = what
+            self.next_report = self.clock()
+
     def wait(self) -> None:
         now = self.clock()
         waited = now - self.start
@@ -521,6 +536,16 @@ class Admission:
         self.release()
 
 
+def survivor_names(survivors: List[dict]) -> str:
+    return ", ".join(sorted(s["name"] for s in survivors))
+
+
+def counts_as_command(survivor: dict) -> bool:
+    """A survivor's container runs a command phase, or is of an older runner that did not label
+    its phase (then it is treated as one)."""
+    return survivor.get("phase") in ("command", None)
+
+
 class Gate:
     """At most `max_runs` command phases at once; an exclusive run has the machine to itself.
 
@@ -533,16 +558,23 @@ class Gate:
       slot-<i>    an ordinary run holds one of slot-0 .. slot-<max_runs - 1>.
     An ordinary run takes the three in one attempt or none, and retries; it never holds the shared
     lock while it waits for a slot, so it cannot delay an exclusive run that is already waiting.
+
+    A command container can outlive its runner (SIGKILL): its locks are gone but it still runs.
+    `survivors()` lists such containers (Survivors); each one whose phase is the command
+    counts as a held slot, and an exclusive run waits until none is left. It is called only once
+    the locks would admit the run, so a waiting run does not ask Docker on every poll.
     """
 
     def __init__(self, directory: Path, max_runs: int, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, report: Callable[[str], None] = _report_stderr,
-                 poll: float = 0.5, report_every: float = 30.0):
+                 poll: float = 0.5, report_every: float = 30.0,
+                 survivors: Optional[Callable[[], List[dict]]] = None):
         if not 1 <= max_runs <= MAX_RUNS_LIMIT:
             raise DevrunError(f"the run cap must be between 1 and {MAX_RUNS_LIMIT}")
         self.directory, self.max_runs = directory, max_runs
         self.clock, self.sleep, self.report = clock, sleep, report
         self.poll, self.report_every = poll, report_every
+        self.survivors = survivors or (lambda: [])
 
     def waiter(self, what: str, limit: Optional[float], poll: Optional[float] = None) -> Waiter:
         return Waiter(what, limit, self.clock, self.sleep, self.report, poll or self.poll, self.report_every)
@@ -566,29 +598,54 @@ class Gate:
         w = self.waiter("exclusive access (another exclusive run is queued or running)", limit)
         while not _try_lock(turnstile, fcntl.LOCK_EX):
             w.wait()
-        w.what = "exclusive access (ordinary runs are finishing; new ones wait behind this run)"
+        w.because("exclusive access (ordinary runs are finishing; new ones wait behind this run)")
         while not _try_lock(shared, fcntl.LOCK_EX):
             w.wait()
-        return Admission(opened)
+        # Every admitted run has finished; a container whose runner died may still be running.
+        while True:
+            left = [s for s in self.survivors() if counts_as_command(s)]
+            if not left:
+                return Admission(opened)
+            w.because(f"exclusive access (the runner of {survivor_names(left)} is dead but its command "
+                      f"is still running; new runs wait behind this run)")
+            w.wait()
 
     def _admit_ordinary(self, turnstile: int, shared: int, opened: List[int], limit: Optional[float]) -> Admission:
         slots = []
         for i in range(self.max_runs):
             slots.append(_open_lock(self.directory / f"slot-{i}"))
             opened.append(slots[-1])
-        w = self.waiter(f"a run slot (at most {self.max_runs} at once, or an exclusive run is queued)", limit)
+        plain = f"a run slot (at most {self.max_runs} at once, or an exclusive run is queued)"
+        w = self.waiter(plain, limit)
         while True:
-            got = None
+            got: List[int] = []
             if _try_lock(turnstile, fcntl.LOCK_EX):
                 try:
                     if _try_lock(shared, fcntl.LOCK_SH):
-                        got = next((fd for fd in slots if _try_lock(fd, fcntl.LOCK_EX)), None)
-                        if got is None:
+                        # Take every free slot for a moment, to count them: ordinary attempts pass
+                        # the turnstile one at a time, so no other run takes a slot meanwhile.
+                        got = [fd for fd in slots if _try_lock(fd, fcntl.LOCK_EX)]
+                        left = [s for s in self.survivors() if counts_as_command(s)] if got else []
+                        alone = [s for s in left if s.get("exclusive")]
+                        if alone:
+                            w.because(f"a run slot (the runner of {survivor_names(alone)}, an exclusive run, "
+                                      f"is dead but its command still runs and keeps the machine to itself)")
+                        elif len(got) <= len(left):
+                            w.because(f"a run slot (at most {self.max_runs} at once; the runner of "
+                                      f"{survivor_names(left)} is dead but its command still runs)" if left else plain)
+                        if alone or len(got) <= len(left):
+                            for fd in got:
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                            got = []
                             fcntl.flock(shared, fcntl.LOCK_UN)
+                        else:
+                            for fd in got[1:]:
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                            got = got[:1]
                 finally:
                     fcntl.flock(turnstile, fcntl.LOCK_UN)
-            if got is not None:
-                keep = [shared, got]
+            if got:
+                keep = [shared, got[0]]
                 for fd in opened:
                     if fd not in keep:
                         os.close(fd)
@@ -596,12 +653,21 @@ class Gate:
                 return Admission(list(keep))
             w.wait()
 
-    def hold(self, name: str, what: str, limit: Optional[float]) -> Admission:
-        """An exclusive lock on one named file, such as a project's fetch lock."""
+    def hold(self, name: str, what: str, limit: Optional[float],
+             blocking: Optional[Callable[[dict], bool]] = None) -> Admission:
+        """An exclusive lock on one named file, such as a project's fetch lock. With `blocking`,
+        the lock is also not taken while a survivor for which blocking(survivor) is true runs."""
         fd = _open_lock(self.directory / name)
         try:
             w = self.waiter(what, limit)
             while not _try_lock(fd, fcntl.LOCK_EX):
+                w.wait()
+            while blocking:
+                left = [s for s in self.survivors() if blocking(s)]
+                if not left:
+                    break
+                w.because(f"{what.split(' (')[0]} (the runner of {survivor_names(left)} is dead "
+                          f"but its container still runs)")
                 w.wait()
         except BaseException:
             os.close(fd)
@@ -650,7 +716,9 @@ def run_liveness(directory: Path, run_id: str) -> str:
     except FileNotFoundError:
         return "unknown"
     try:
-        if not _try_lock(fd, fcntl.LOCK_EX):
+        # A shared lock: the run itself holds the record exclusively for as long as it lives, so a
+        # live run still reads 'alive', and two probes of a dead run's record never see each other.
+        if not _try_lock(fd, fcntl.LOCK_SH):
             return "alive"
         held = os.fstat(fd)
         try:
@@ -674,6 +742,107 @@ def live_run_facts(directory: Path) -> Optional[List[dict]]:
         except (OSError, ValueError):
             return None
     return facts
+
+
+def parse_docker_time(text: str) -> float:
+    """Seconds since the epoch for a time as Docker prints it (RFC 3339 with up to nanoseconds,
+    such as 2026-11-14T03:19:46.51321438Z or 2026-11-13T19:21:36.244827538-08:00)."""
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", text.strip())
+    if not m:
+        raise DevrunError(f"cannot read the Docker time {text!r}")
+    base, frac, zone = m.groups()
+    stamp = datetime.datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone)).timestamp()
+    return stamp + (float("0." + frac) if frac else 0.0)
+
+
+def docker_now() -> float:
+    """The Docker daemon's current time, so that a container's start time is compared with the
+    clock that wrote it."""
+    p = run(["docker", "info", "--format", "{{json .SystemTime}}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"docker info failed: {p.stderr.decode(errors='replace').strip()}")
+    return parse_docker_time(json_loads(p.stdout.decode()))
+
+
+class Survivors:
+    """Running containers of this tool whose runner is dead (docs/hygiene.md section 10).
+
+    A container counts only when it carries the role dev-run, a valid owner and run id label, a
+    name that matches them, and a liveness record in this state directory that --gc's test proves
+    dead. A container of a run in another state directory is of unknown state and never counts.
+    With `stop_overdue`, a survivor whose own timeout (its timeout label, from its start, by the
+    daemon's clock) has passed is killed, and is no longer listed once Docker confirms it stopped:
+    that is the timeout its runner would have enforced. A survivor without a timeout label (from
+    an older runner) is never stopped, only waited for.
+    """
+
+    def __init__(self, directory: Path, project: Optional[str] = None, stop_overdue: bool = True,
+                 report: Callable[[str], None] = _report_stderr, now: Callable[[], float] = docker_now):
+        self.directory, self.project, self.stop_overdue = directory, project, stop_overdue
+        self.report, self.now = report, now
+
+    def scan(self) -> List[dict]:
+        filters = ["--filter", f"label={ROLE_LABEL}=dev-run", "--filter", f"label={RUN_ID_LABEL}"]
+        if self.project:
+            filters += ["--filter", f"label={OWNER_LABEL}={self.project}"]
+        p = run(["docker", "ps", "-q", "--no-trunc", *filters], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise DevrunError(f"docker ps failed: {p.stderr.decode(errors='replace').strip()}")
+        found = []
+        for d in _inspect(["container"], p.stdout.decode().split(), all_container_ids):
+            labels = d["Config"].get("Labels") or {}
+            project, rid = labels.get(OWNER_LABEL) or "", labels.get(RUN_ID_LABEL) or ""
+            name = d["Name"].lstrip("/")
+            if (labels.get(ROLE_LABEL) != "dev-run" or not PROJECT_RE.fullmatch(project) or not RUN_ID_RE.fullmatch(rid)
+                    or name != run_resource_names(project, rid)["container"] or not d["State"]["Running"]):
+                continue
+            if run_liveness(self.directory, rid) != "dead":
+                continue
+            found.append({"id": d["Id"], "name": name, "project": project, "run_id": rid,
+                          "exclusive": labels.get(ADMISSION_LABEL) == "exclusive" or self._recorded_exclusive(rid),
+                          "phase": labels.get(PHASE_LABEL), "timeout": labels.get(TIMEOUT_LABEL),
+                          "started": d["State"].get("StartedAt") or "",
+                          "mounts": [m.get("Name") for m in d.get("Mounts") or [] if m.get("Type") == "volume"]})
+        return found
+
+    def _recorded_exclusive(self, run_id: str) -> bool:
+        """Whether the dead run's record says it asked for exclusive admission."""
+        try:
+            facts = json_loads((self.directory / "runs" / f"{run_id}.lock").read_text())
+        except (OSError, ValueError):
+            return False
+        return isinstance(facts, dict) and facts.get("admission") == "exclusive"
+
+    def deadline(self, survivor: dict) -> Optional[float]:
+        """When the survivor's own timeout ends, by the daemon's clock; None without a timeout label."""
+        timeout = survivor.get("timeout") or ""
+        if not timeout.isdigit() or not survivor.get("started"):
+            return None
+        return parse_docker_time(survivor["started"]) + int(timeout)
+
+    def stop(self, survivor: dict) -> bool:
+        """Kill one overdue survivor by its id; True once Docker confirms that it stopped."""
+        self.report(f"devrun: stopping {survivor['name']}: its runner is dead and its "
+                    f"{survivor['timeout']} s timeout has passed")
+        run(["docker", "kill", survivor["id"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            p = run(["docker", "wait", survivor["id"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except subprocess.TimeoutExpired:
+            return False
+        return p.returncode == 0
+
+    def __call__(self) -> List[dict]:
+        found = self.scan()
+        if not self.stop_overdue or not any(self.deadline(s) is not None for s in found):
+            return found
+        now = self.now()
+        left = []
+        for s in found:
+            end = self.deadline(s)
+            if end is not None and now >= end and self.stop(s):
+                continue
+            left.append(s)
+        return left
 
 
 # --------------------------------------------------------------------------- #
@@ -743,20 +912,38 @@ class Docker:
         self.memory = memory
         self.names = run_resource_names(project, run_id)
         self.name = self.names["container"]
-        # True only between a successful `docker create` by this run and its removal, so cleanup
-        # never touches a container that this run did not create.
-        self.created = False
-        # Per-run volumes this run created and has not removed yet; cleanup removes only these.
+        # The run container: "absent", "uncertain" (a create was sent and its outcome is not
+        # known, for example because a signal interrupted it), or "created". Cleanup removes it
+        # only when this run created it, resolving "uncertain" by listing this run's labels.
+        self.state = "absent"
+        # Per-run volumes that may exist because this run asked Docker to create them, and have
+        # not been removed yet; cleanup removes only these. A name is added before the create is
+        # sent, and stays in `unconfirmed` until the create is confirmed.
         self.volumes: List[str] = []
+        self.unconfirmed: Set[str] = set()
+        # Locks (a run slot, the exclusive gate, the fetch or pinned-build lock) that must stay held
+        # until the running container is confirmed stopped or removed (docs/hygiene.md section 10).
+        self.holds: List[Admission] = []
 
-    def labels(self, role: str) -> List[str]:
-        return label_args(resource_labels(self.project, role, self.run_id))
+    def labels(self, role: str, extra: Optional[Dict[str, str]] = None) -> List[str]:
+        return label_args(resource_labels(self.project, role, self.run_id, extra))
 
     def _volume_labels(self, name: str) -> Optional[dict]:
         p = run(["docker", "volume", "inspect", name, "--format", "{{json .Labels}}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             return None
         return json_loads(p.stdout.decode() or "null") or {}
+
+    def _listed(self, kind: str) -> Optional[Set[str]]:
+        """The names of this run's own containers ("container") or volumes ("volume") that exist,
+        selected by this run's owner and run id labels; None when Docker cannot list them."""
+        cmd = (["docker", "ps", "-a", "--format", "{{.Names}}"] if kind == "container"
+               else ["docker", "volume", "ls", "--format", "{{.Name}}"])
+        p = run([*cmd, "--filter", f"label={OWNER_LABEL}={self.project}", "--filter", f"label={RUN_ID_LABEL}={self.run_id}"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            return None
+        return set(p.stdout.decode().split())
 
     def ensure_volume(self, name: str, role: str, extra: Optional[Dict[str, str]] = None) -> None:
         """Create a shared volume, or check that the existing one is ours (and, for a target, that
@@ -778,17 +965,25 @@ class Docker:
         name = self.names[role]
         if self._volume_labels(name) is not None:
             raise DevrunError(f"refused: volume {name} already exists (run id collision, or litter)")
+        # From here on the volume may exist, even if the create below is interrupted.
+        self.volumes.append(name)
+        self.unconfirmed.add(name)
         p = run(["docker", "volume", "create", *self.labels(role), name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise DevrunError(f"docker volume create {name} failed: {p.stderr.decode(errors='replace').strip()}")
-        self.volumes.append(name)
+        self.unconfirmed.discard(name)
         return name
 
     def create(self, cmd: List[str], network: bool, target_volume: str, env: Optional[dict] = None,
-               caches_writable: bool = False) -> None:
-        """Create the run container. The cargo caches are writable only in the fetch phase."""
+               caches_writable: bool = False, phase: str = "command", timeout: int = 300,
+               admission: Optional[str] = None) -> None:
+        """Create the run container. The cargo caches are writable only in the fetch phase. The
+        phase and the timeout are labels, so that another run can recognize a container whose
+        runner died and enforce its timeout (Survivors)."""
         ro = "" if caches_writable else ",readonly"
-        args = ["docker", "create", "--name", self.name, *self.labels("dev-run"),
+        args = ["docker", "create", "--name", self.name,
+                *self.labels("dev-run", {PHASE_LABEL: phase, TIMEOUT_LABEL: str(timeout),
+                                         **({ADMISSION_LABEL: admission} if admission else {})}),
                 "--user", f"{UID}:{GID}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=1g,mode=1777",
                 "--pids-limit", "4096", "--memory", self.memory, "--memory-swap", self.memory, "--cpus", self.cpus,
@@ -811,10 +1006,12 @@ class Docker:
         for k, v in (env or {}).items():
             args += ["--env", f"{k}={v}"]
         args += [self.image, *cmd]
+        # From here on the container may exist, even if the create below is interrupted.
+        self.state = "uncertain"
         p = run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise DevrunError(f"docker create failed: {p.stderr.decode(errors='replace').strip()}")
-        self.created = True
+        self.state = "created"
 
     def copy_in(self, tar_path: Path, dest: str) -> None:
         with open(tar_path, "rb") as fh:
@@ -822,13 +1019,29 @@ class Docker:
         if p.returncode != 0:
             raise DevrunError(f"docker cp into {dest} failed: {p.stderr.decode(errors='replace').strip()}")
 
-    def start(self, timeout: int) -> int:
+    def start(self, timeout: int, holds: Iterable[Admission] = ()) -> int:
+        """Run the created container to its end. The `holds` stay held until the container is
+        confirmed stopped here, or removed by remove() or cleanup(): a timeout, a signal, or an
+        error in between never releases them while the container may still run."""
+        self.holds.extend(holds)
         try:
             p = run(["docker", "start", "-a", self.name], timeout=timeout)
         except subprocess.TimeoutExpired:
             run(["docker", "kill", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             raise DevrunError(f"timeout after {timeout}s; container killed")
+        if self.holds and self.stopped():
+            self.release_holds()
         return p.returncode
+
+    def stopped(self) -> bool:
+        """True when Docker confirms that the run container exists and is not running."""
+        p = run(["docker", "container", "inspect", "--format", "{{.State.Running}}", self.name],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return p.returncode == 0 and p.stdout.strip() == b"false"
+
+    def release_holds(self) -> None:
+        while self.holds:
+            self.holds.pop().release()
 
     def export(self, path: str, dest: Path) -> List[str]:
         p = subprocess.Popen(["docker", "cp", f"{self.name}:/scratch/out/{path}", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -842,23 +1055,47 @@ class Docker:
         return written
 
     def remove(self) -> None:
-        """Remove the run container, only if this run created it."""
-        if not self.created:
-            return
-        p = run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if p.returncode == 0:
-            self.created = False
+        """Remove the run container, only if this run created it, and then release the holds."""
+        if self.state == "uncertain":
+            listed = self._listed("container")
+            if listed is None:
+                return  # cannot tell; keep the holds, and cleanup reports the run as not clean
+            self.state = "created" if self.name in listed else "absent"
+        if self.state == "created":
+            p = run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if p.returncode == 0:
+                self.state = "absent"
+            else:
+                listed = self._listed("container")
+                if listed is not None and self.name not in listed:
+                    self.state = "absent"
+        if self.state == "absent":
+            self.release_holds()
 
     def cleanup(self) -> bool:
-        """Remove this run's container and volumes. True when nothing this run created is left."""
+        """Remove this run's container and volumes. True when nothing this run created is left.
+        The holds are released only once the container is gone."""
         self.remove()
+        listed: Optional[Set[str]] = None
         for name in list(self.volumes):
+            if name in self.unconfirmed:
+                # The create may or may not have happened: a fresh listing of this run's labelled
+                # volumes decides. A volume that is not listed was never created by this run.
+                listed = self._listed("volume") if listed is None else listed
+                if listed is None:
+                    print(f"devrun: cannot tell whether volume {name} was created; keeping the run record", file=sys.stderr)
+                    continue
+                if name not in listed:
+                    self.volumes.remove(name)
+                    self.unconfirmed.discard(name)
+                    continue
             p = run(["docker", "volume", "rm", name], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if p.returncode == 0:
                 self.volumes.remove(name)
+                self.unconfirmed.discard(name)
             else:
                 print(f"devrun: could not remove volume {name}: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
-        return not self.created and not self.volumes
+        return self.state == "absent" and not self.volumes
 
     def exists(self) -> bool:
         p = run(["docker", "ps", "-a", "--filter", f"name=^{self.name}$", "--format", "{{.Names}}"], stdout=subprocess.PIPE)
@@ -883,8 +1120,8 @@ def plan_gc(project: str, containers: List[dict], volumes: List[dict], liveness:
     liveness(run_id) -> 'alive' | 'dead' | 'unknown'; only 'dead' allows removal.
     protected_keys: source keys of live runs' targets, or None when that is unknown (then no
     target volume is removed).
-    Selected: stopped containers and per-run volumes of dead runs, and target volumes whose source
-    path no longer exists. Never selected: anything without this project's owner label, anything
+    Selected: stopped containers and per-run volumes of dead runs, and target volumes (worktree or
+    pinned) whose source path no longer exists. Never selected: anything without this project's owner label, anything
     whose name does not match its labels, anything attached to a running container or to a
     container that is not itself selected, the cargo caches, and legacy fixed-name volumes.
     """
@@ -908,8 +1145,9 @@ def plan_gc(project: str, containers: List[dict], volumes: List[dict], liveness:
         if state != "dead":
             kept.append((c["name"], f"run {rid} is {state}"))
         elif c.get("running"):
-            kept.append((c["name"], f"run {rid} is dead but its container is still running; "
-                                    f"stop it with docker stop {c['name']} and run --gc again"))
+            kept.append((c["name"], f"run {rid} is dead but its container is still running, within its timeout; "
+                                    f"devrun stops it when that has passed, or stop it with docker stop {c['name']}, "
+                                    f"then run --gc again"))
         else:
             remove_containers.append(c["name"])
 
@@ -940,12 +1178,12 @@ def plan_gc(project: str, containers: List[dict], volumes: List[dict], liveness:
                 kept.append((name, problem))
             else:
                 remove_volumes.append(name)
-        elif role == "target":
+        elif role in TARGET_ROLES:
             path, key = labels.get(SOURCE_PATH_LABEL), labels.get(SOURCE_KEY_LABEL) or ""
             if not path:
                 kept.append((name, "no source path label (legacy per-project target); not touched"))
                 continue
-            if not SOURCE_KEY_RE.fullmatch(key) or key != source_key(path) or name != target_volume_name(project, key):
+            if not SOURCE_KEY_RE.fullmatch(key) or key != source_key(path) or name != target_volume_name(project, key, role):
                 kept.append((name, "its name and source labels do not match; not touched"))
                 continue
             if path_exists(path):
@@ -962,27 +1200,58 @@ def plan_gc(project: str, containers: List[dict], volumes: List[dict], liveness:
     return {"containers": remove_containers, "volumes": remove_volumes, "kept": kept}
 
 
-def _inspect(kind: List[str], names: List[str]) -> List[dict]:
-    if not names:
-        return []
-    p = run(["docker", *kind, "inspect", *names], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # A resource removed between the listing and the inspect makes the inspect exit 1 but still
-    # prints the others.
-    return json_loads(p.stdout.decode() or "[]") if p.stdout.strip() else []
-
-
-def docker_inventory(project: str) -> tuple:
+def all_container_ids() -> Set[str]:
     p = run(["docker", "ps", "-aq", "--no-trunc"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise DevrunError(f"docker ps failed: {p.stderr.decode(errors='replace').strip()}")
-    containers = [{"name": d["Name"].lstrip("/"), "running": bool(d["State"]["Running"]),
-                   "labels": d["Config"].get("Labels") or {},
-                   "mounts": [m.get("Name") for m in d.get("Mounts") or [] if m.get("Type") == "volume"]}
-                  for d in _inspect(["container"], p.stdout.decode().split())]
+    return set(p.stdout.decode().split())
+
+
+def project_volume_names(project: str) -> Set[str]:
     p = run(["docker", "volume", "ls", "-q", "--filter", f"label={OWNER_LABEL}={project}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise DevrunError(f"docker volume ls failed: {p.stderr.decode(errors='replace').strip()}")
-    volumes = [{"name": d["Name"], "labels": d.get("Labels") or {}} for d in _inspect(["volume"], p.stdout.decode().split())]
+    return set(p.stdout.decode().split())
+
+
+def _inspect(kind: List[str], names: List[str], listing: Callable[[], Set[str]]) -> List[dict]:
+    """docker inspect of the named resources (container ids, or volume names).
+
+    A resource removed between the listing and the inspect makes the inspect exit 1 while it still
+    prints the others. That is accepted only when every requested name missing from the output is
+    also missing from a fresh `listing()`. Any other failure raises, so that a resource that still
+    exists is never taken for an absent one (--gc would then forget a dead run that has one).
+    """
+    if not names:
+        return []
+    p = run(["docker", *kind, "inspect", *names], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    what = f"docker {' '.join(kind)} inspect"
+    err = p.stderr.decode(errors="replace").strip()
+    try:
+        found = json_loads(p.stdout.decode()) if p.stdout.strip() else []
+    except ValueError:
+        raise DevrunError(f"{what} printed something that is not JSON: {err}")
+    if not isinstance(found, list):
+        raise DevrunError(f"{what} printed something that is not a list: {err}")
+    key = "Id" if kind == ["container"] else "Name"
+    printed = {d.get(key) for d in found if isinstance(d, dict)}
+    missing = [n for n in names if n not in printed]
+    if p.returncode != 0 or missing:
+        if not missing:
+            raise DevrunError(f"{what} failed: {err}")
+        still = listing() & set(missing)
+        if still:
+            raise DevrunError(f"{what} failed for {', '.join(sorted(still))}, which still exist: {err}")
+    return found
+
+
+def docker_inventory(project: str) -> tuple:
+    containers = [{"name": d["Name"].lstrip("/"), "running": bool(d["State"]["Running"]),
+                   "labels": d["Config"].get("Labels") or {},
+                   "mounts": [m.get("Name") for m in d.get("Mounts") or [] if m.get("Type") == "volume"]}
+                  for d in _inspect(["container"], sorted(all_container_ids()), all_container_ids)]
+    volumes = [{"name": d["Name"], "labels": d.get("Labels") or {}}
+               for d in _inspect(["volume"], sorted(project_volume_names(project)), lambda: project_volume_names(project))]
     return containers, volumes
 
 
@@ -996,6 +1265,17 @@ def gc_main(argv: List[str]) -> int:
     directory = state_dir()
     live = live_run_facts(directory)
     protected = None if live is None else {f.get("source_key") for f in live if f.get("project") == ns.project}
+    # A dead run's container that is past its own timeout is stopped first (dry run: only said).
+    survivors = Survivors(directory, project=ns.project, stop_overdue=not ns.dry_run)
+    if ns.dry_run:
+        found = survivors()
+        now = docker_now() if any(survivors.deadline(s) is not None for s in found) else 0.0
+        for s in found:
+            end = survivors.deadline(s)
+            if end is not None and now >= end:
+                print(f"devrun gc: would stop container {s['name']}: its runner is dead and its {s['timeout']} s timeout has passed")
+    else:
+        survivors()
     containers, volumes = docker_inventory(ns.project)
     plan = plan_gc(ns.project, containers, volumes, lambda rid: run_liveness(directory, rid), os.path.isdir, protected)
     verb = "would remove" if ns.dry_run else "remove"
@@ -1116,7 +1396,7 @@ def fetch_environment(env: dict, rust_version: str) -> dict:
 
 def prepare(docker: "Docker", target_volume: str, empty_target: bool) -> None:
     """Empty the copy and scratch volumes (and the evidence target when asked), offline."""
-    docker.create(["bash", "-c", PREP_SCRIPT, "prep", "1" if empty_target else "0"], False, target_volume)
+    docker.create(["bash", "-c", PREP_SCRIPT, "prep", "1" if empty_target else "0"], False, target_volume, phase="prep")
     if docker.start(300) != 0:
         raise DevrunError("preparing the work and scratch volumes failed")
     docker.remove()
@@ -1124,7 +1404,7 @@ def prepare(docker: "Docker", target_volume: str, empty_target: bool) -> None:
 
 def copy_in(docker: "Docker", target_volume: str, tar_path: Path, dest: str, env: dict) -> None:
     """Extract a sanitized tar into the volumes through a short-lived, offline container."""
-    docker.create(["true"], False, target_volume, env)
+    docker.create(["true"], False, target_volume, env, phase="copy")
     docker.copy_in(tar_path, dest)
     if docker.start(300) != 0:
         raise DevrunError("copy-in container failed")
@@ -1142,8 +1422,10 @@ def main_inner(ns: argparse.Namespace) -> int:
     # CI machines run one job at a time and have no lock store: no slots and no registration there.
     coordinated = os.environ.get("CI") != "true"
     directory = state_dir()
-    gate = Gate(directory, ns.max_runs)
-    record = RunRecord(directory, run_id, {"project": ns.project, "source_key": key, "pid": str(os.getpid())})
+    gate = Gate(directory, ns.max_runs, survivors=Survivors(directory))
+    admission_mode = "exclusive" if ns.exclusive else "ordinary"
+    record = RunRecord(directory, run_id, {"project": ns.project, "source_key": key, "pid": str(os.getpid()),
+                                           "admission": admission_mode})
     lease = Lease(f"devrun-{ns.project}-{run_id}", f"devrun-{run_id}", f"host/docker/{docker.name}/",
                   2 * ns.timeout + 2 * ns.wait + 1500, f"devrun {ns.project} run {run_id}")
     work = Path(tempfile.mkdtemp(prefix="devrun-src-"))
@@ -1158,6 +1440,7 @@ def main_inner(ns: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     clean = False
+    no_hold = Admission([])
     try:
         if coordinated:
             lease.claim(gate.waiter("host/docker/ in the lock store (daemon maintenance?)", ns.wait, poll=2.0))
@@ -1173,11 +1456,16 @@ def main_inner(ns: argparse.Namespace) -> int:
             raise DevrunError(f"refused: container {docker.name} already exists (run id collision, or litter)")
         docker.ensure_volume(f"{ns.project}-cargo-registry", "cargo-registry")
         docker.ensure_volume(f"{ns.project}-cargo-git", "cargo-git")
+        # A pinned run (--commit, --history) builds into the worktree's pinned target, never into
+        # the one that --worktree runs use, and holds that target's lock from before its command
+        # starts until its container has stopped (docs/hygiene.md section 5).
+        pinned = mode in ("commit", "history") and not ns.evidence
         if ns.evidence:
             target_volume = docker.create_run_volume("target-evidence")
         else:
-            target_volume = target_volume_name(ns.project, key)
-            docker.ensure_volume(target_volume, "target", {SOURCE_PATH_LABEL: str(top), SOURCE_KEY_LABEL: key})
+            target_role = "target-pinned" if pinned else "target"
+            target_volume = target_volume_name(ns.project, key, target_role)
+            docker.ensure_volume(target_volume, target_role, {SOURCE_PATH_LABEL: str(top), SOURCE_KEY_LABEL: key})
         docker.create_run_volume("work")
         docker.create_run_volume("scratch")
         env = {"DEVRUN_HEAD": facts.get("sha") or "", "DEVRUN_BASE": facts.get("base") or ""}
@@ -1190,15 +1478,17 @@ def main_inner(ns: argparse.Namespace) -> int:
                 fetch_copy(fin, fout)
             prepare(docker, target_volume, ns.evidence)
             copy_in(docker, target_volume, fetch_tar, "/work", env)
-            docker.create(FETCH_COMMAND, True, target_volume, fetch_environment(env, ns.rust), caches_writable=True)
+            docker.create(FETCH_COMMAND, True, target_volume, fetch_environment(env, ns.rust), caches_writable=True,
+                          phase="fetch", timeout=ns.timeout)
             # Cargo's own package-cache lock is $CARGO_HOME/.package-cache, on the read-only root:
             # cargo warns that it cannot open it and fetches without any lock. Two fetches into the
             # project's shared caches would then write the same files at once, so fetch phases of
             # one project take turns on a host file lock (docs/hygiene.md section 10).
-            fetch_lock = (gate.hold(f"fetch-{ns.project}.lock", f"the {ns.project} fetch lock (another run is fetching)", ns.wait)
-                          if coordinated else Admission([]))
-            with fetch_lock:
-                fetched = docker.start(ns.timeout)
+            # A fetch container whose runner died still writes the caches, so it holds the lock too.
+            fetch_lock = (gate.hold(f"fetch-{ns.project}.lock", f"the {ns.project} fetch lock (another run is fetching)", ns.wait,
+                                    blocking=lambda s: s["project"] == ns.project and s.get("phase") in ("fetch", None))
+                          if coordinated else no_hold)
+            fetched = docker.start(ns.timeout, [fetch_lock])
             if fetched != 0:
                 raise DevrunError("cargo fetch --locked failed")
             docker.remove()
@@ -1209,10 +1499,19 @@ def main_inner(ns: argparse.Namespace) -> int:
         cmd = ["bash", "-c", INNER_SCRIPT, "run", mode, "1" if ns.export_patch else "0", *ns.command]
         env["CARGO_NET_OFFLINE"] = "false" if ns.network else "true"
         env["DEVRUN_FRESH_MTIMES"] = "1" if mode == "commit" else "0"
-        docker.create(cmd, ns.network, target_volume, env)
-        admission = gate.admit(ns.exclusive, ns.wait) if coordinated else Admission([])
-        with admission:
-            status = docker.start(ns.timeout)
+        # The admission mode is a label and in the record, so that if this runner dies, other runs
+        # know that its surviving command had the machine to itself.
+        docker.create(cmd, ns.network, target_volume, env, timeout=ns.timeout, admission=admission_mode)
+        # The pinned-target lock comes first and admission second: a run never holds a slot or the
+        # exclusive gate while it waits for another run of its worktree. Both stay held until the
+        # container is confirmed stopped or removed (Docker.start, Docker.remove).
+        build_lock = (gate.hold(f"pinned-{ns.project}-{key}.lock",
+                                "the pinned build target of this worktree (another --commit or --history run of it is running)",
+                                ns.wait, blocking=lambda s: target_volume in s["mounts"] and counts_as_command(s))
+                      if coordinated and pinned else no_hold)
+        docker.holds.append(build_lock)
+        admission = gate.admit(ns.exclusive, ns.wait) if coordinated else no_hold
+        status = docker.start(ns.timeout, [admission])
         exported: List[str] = []
         for path in ns.export:
             exported += docker.export(path, out)
@@ -1224,9 +1523,16 @@ def main_inner(ns: argparse.Namespace) -> int:
         print(f"devrun: exit {status}; exports in {out}: {', '.join(exported) or 'none'}", file=sys.stderr)
         return status
     finally:
+        # A signal that arrives now must not cut the cleanup short either.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         clean = docker.cleanup()
         lease.release()
         record.finish(clean)
+        # Locks still held here belong to a container that cleanup could not confirm gone. They
+        # are released only after the record is unlocked, which marks the run dead, so that other
+        # runs count the container as a survivor from the moment the locks are free.
+        docker.release_holds()
         if not clean:
             print(f"devrun: run {run_id} left resources behind; remove them with: devrun --gc {ns.project}", file=sys.stderr)
         for p in work.glob("*"):

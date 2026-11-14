@@ -162,6 +162,65 @@ commit_b="$(git -C "$bin" rev-parse HEAD)"
 got="$("$devrun" "$project" "$bin" --commit "$commit_b" "${small[@]}" -- cargo run -q --locked 2>/dev/null)"
 [[ "$got" == built-from-B ]] || fail "commit B ran the stale build of commit A: $got"
 
+echo "== two --commit runs of one worktree at once: the second never reuses the first one's build (issue #12, 1)"
+# A refreshes its copy, then waits until B has refreshed its own copy too, then builds. B waits for A's
+# build, then builds. Without the pinned-target lock B's copy predates A's build, and cargo reuses A's
+# binary. With the lock B cannot start until A has finished, so A's wait for B ends at its bound.
+pin="$work/pin"; mkdir -p "$pin/src"
+printf '[package]\nname = "pin"\nversion = "0.1.0"\nedition = "2021"\n' > "$pin/Cargo.toml"
+printf 'version = 4\n\n[[package]]\nname = "pin"\nversion = "0.1.0"\n' > "$pin/Cargo.lock"
+printf 'fn main() { println!("built-from-P1"); }\n' > "$pin/src/main.rs"
+git -C "$pin" init -q -b main && git -C "$pin" add -A && git -C "$pin" -c user.name=t -c user.email=t@invalid commit -qm P1
+commit_p1="$(git -C "$pin" rev-parse HEAD)"
+printf 'fn main() { println!("built-from-P2"); }\n' > "$pin/src/main.rs"
+git -C "$pin" -c user.name=t -c user.email=t@invalid commit -qam P2
+commit_p2="$(git -C "$pin" rev-parse HEAD)"
+# await FILE TENTHS: wait inside the container until FILE exists in the shared target, at most TENTHS/10 s.
+# shellcheck disable=SC2016  # expands inside the container.
+await='await() { i=0; while [ ! -e "$1" ] && [ "$i" -lt "$2" ]; do sleep 0.1; i=$((i + 1)); done; }'
+# shellcheck disable=SC2016
+pin_a="$await"'; echo "start $(date +%s.%N)"; await /target/sync-b 150; echo "build $(date +%s.%N)"; cargo run -q --locked; touch /target/sync-a; echo "end $(date +%s.%N)"'
+# shellcheck disable=SC2016
+pin_b="$await"'; echo "start $(date +%s.%N)"; touch /target/sync-b; await /target/sync-a 600; cargo run -q --locked'
+spawn "$project" "$pin" --commit "$commit_p1" "${small[@]}" -- bash -c "$pin_a" >"$work/pa.out" 2>"$work/pa.err" & p1=$!
+pids=("$p1")
+wait_for 120 "commit run A's command to start" has_line '^start ' "$work/pa.out"
+spawn "$project" "$pin" --commit "$commit_p2" "${small[@]}" -- bash -c "$pin_b" >"$work/pb.out" 2>"$work/pb.err" & p2=$!
+pids+=("$p2")
+wait "$p1" || fail "commit run A failed: $(cat "$work/pa.err")"
+wait "$p2" || fail "commit run B failed: $(cat "$work/pb.err")"
+pids=()
+grep -qx built-from-P1 "$work/pa.out" || fail "commit run A did not run its own build: $(cat "$work/pa.out")"
+grep -qx built-from-P2 "$work/pb.out" || fail "commit run B ran another commit's build: $(grep built-from "$work/pb.out")"
+grep -q 'waiting for the pinned build target of this worktree' "$work/pb.err" || fail "commit run B did not wait for run A"
+before "$(field end "$work/pa.out")" "$(field start "$work/pb.out")" || fail "two pinned runs of one worktree overlapped"
+
+echo "== a --worktree run during a --commit run of the same worktree: the commit run builds its own source"
+# C refreshes its copy, waits for W's build, then builds; W builds once C has refreshed. In one shared
+# target C would reuse W's build. Pinned runs have their own target, so neither sees the other's marker
+# files and both waits end at their bound.
+printf 'fn main() { println!("built-from-W"); }\n' > "$pin/src/main.rs"
+# shellcheck disable=SC2016
+pin_c="$await"'; echo "start $(date +%s.%N)"; touch /target/sync-c; await /target/sync-w 150; cargo run -q --locked'
+# shellcheck disable=SC2016
+pin_w="$await"'; await /target/sync-c 150; cargo run -q --locked; touch /target/sync-w'
+spawn "$project" "$pin" --commit "$commit_p2" "${small[@]}" -- bash -c "$pin_c" >"$work/pc.out" 2>"$work/pc.err" & p1=$!
+spawn "$project" "$pin" --worktree "${small[@]}" -- bash -c "$pin_w" >"$work/pw.out" 2>"$work/pw.err" & p2=$!
+pids=("$p1" "$p2")
+wait "$p1" || fail "commit run C failed: $(cat "$work/pc.err")"
+wait "$p2" || fail "worktree run W failed: $(cat "$work/pw.err")"
+pids=()
+grep -qx built-from-P2 "$work/pc.out" || fail "commit run C ran the worktree's build: $(grep built-from "$work/pc.out")"
+grep -qx built-from-W "$work/pw.out" || fail "worktree run W did not run its own build: $(cat "$work/pw.out")"
+
+echo "== a --worktree run after a --commit run sees an edit made before the commit run (issue #9, case 1)"
+printf 'fn main() { println!("built-from-E"); }\n' > "$pin/src/main.rs"
+[[ "$(prun "$project" "$pin" --commit "$commit_p2" "${small[@]}" -- cargo run -q --locked 2>/dev/null)" == built-from-P2 ]] ||
+  fail "the commit run did not build its commit"
+got="$(prun "$project" "$pin" --worktree "${small[@]}" -- cargo run -q --locked 2>/dev/null)"
+[[ "$got" == built-from-E ]] || fail "the worktree run reused the commit run's build: $got"
+no_run_leftovers
+
 echo "== two runs of the same project at once, from two worktrees of one repository"
 git -C "$repo" add -A && git -C "$repo" -c user.name=t -c user.email=t@invalid commit -qm "worktree base"
 git -C "$repo" worktree add -q "$work/wt2"
@@ -244,6 +303,87 @@ wait_for 60 "the orphaned container to exit" stopped
 env DEVRUN_STATE_DIR="$private" "$devrun" --gc "$project" >"$work/gc2.out" || fail "gc failed: $(cat "$work/gc2.out")"
 [[ -z "$(leftovers_of "$rid")" ]] || fail "gc left resources of dead run $rid: $(leftovers_of "$rid")"
 [[ ! -e "$private/runs/$rid.lock" ]] || fail "gc did not forget the dead run"
+
+# epoch NAME FIELD: a container's State.StartedAt or State.FinishedAt, in seconds, by the daemon's clock.
+epoch() {
+  python3 -c 'import datetime, re, sys
+m = re.fullmatch(r"(\S+?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", sys.argv[1])
+zone = "+00:00" if m.group(3) == "Z" else m.group(3)
+print("%.3f" % (datetime.datetime.fromisoformat(m.group(1) + zone).timestamp() + float("0." + (m.group(2) or "0"))))' \
+    "$(docker inspect -f "{{.State.$2}}" "$1")"
+}
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+not_running() { ! running "$1"; }
+# finished NAME: when the container stopped. Docker reports year 1 for a running container, so wait.
+finished() {
+  wait_for 300 "container $1 to stop" not_running "$1"
+  local t; t="$(epoch "$1" FinishedAt)"
+  before 1000000000 "$t" || fail "container $1 has no finish time: $t"
+  echo "$t"
+}
+waits_or_starts() { has_line "$1" "$2" || has_line '^start ' "$3"; }
+
+echo "== SIGKILL: the surviving container keeps its slot, and an exclusive run waits until it ends (issue #12, 2)"
+spawn "$project" "$repo" --worktree "${small[@]}" --max-runs 1 -- bash -c "$timed" timed 20 >"$work/s.out" 2>"$work/s.err" & ps_=$!
+pids=("$ps_")
+wait_for 120 "the run's command to start" has_line '^start ' "$work/s.out"
+srid="$(run_id_of "$work/s.err")"; survivor="$project-dev-run-$srid"
+kill -KILL "$ps_"
+wait "$ps_" 2>/dev/null || true
+running "$survivor" || fail "the container did not survive its runner"
+spawn "$project" "$work/wt2" --worktree "${small[@]}" --max-runs 1 -- bash -c "$timed" timed 1 >"$work/o.out" 2>"$work/o.err" & po=$!
+pids=("$po")
+wait_for 120 "the ordinary run to wait or start" waits_or_starts "runner of $survivor is dead" "$work/o.err" "$work/o.out"
+if has_line '^start ' "$work/o.out" && running "$survivor"; then fail "an ordinary run started beside the survivor under --max-runs 1"; fi
+spawn "$project" "$repo" --worktree "${small[@]}" --exclusive -- bash -c "$timed" timed 1 >"$work/x.out" 2>"$work/x.err" & px=$!
+pids+=("$px")
+wait_for 120 "the exclusive run to wait or start" waits_or_starts "exclusive access (the runner of $survivor is dead" "$work/x.err" "$work/x.out"
+wait "$po" || fail "the ordinary run failed: $(cat "$work/o.err")"
+wait "$px" || fail "the exclusive run failed: $(cat "$work/x.err")"
+pids=()
+survivor_end="$(finished "$survivor")"
+before "$survivor_end" "$(field start "$work/o.out")" || fail "the ordinary run started before the survivor ended"
+before "$survivor_end" "$(field start "$work/x.out")" || fail "the exclusive run started before the survivor ended"
+
+echo "== SIGKILL of an exclusive run: its surviving command still keeps ordinary runs out (review of #13)"
+# The cap is the default 4, so only the exclusive mode, not the slot count, can keep the ordinary run out.
+spawn "$project" "$repo" --worktree "${small[@]}" --exclusive -- bash -c "$timed" timed 15 >"$work/es.out" 2>"$work/es.err" & pes=$!
+pids=("$pes")
+wait_for 120 "the exclusive run's command to start" has_line '^start ' "$work/es.out"
+erid="$(run_id_of "$work/es.err")"; esurvivor="$project-dev-run-$erid"
+kill -KILL "$pes"
+wait "$pes" 2>/dev/null || true
+running "$esurvivor" || fail "the exclusive run's container did not survive its runner"
+spawn "$project" "$work/wt2" --worktree "${small[@]}" -- bash -c "$timed" timed 1 >"$work/eo.out" 2>"$work/eo.err" & peo=$!
+pids=("$peo")
+wait_for 120 "the ordinary run to wait or start" waits_or_starts "runner of $esurvivor, an exclusive run," "$work/eo.err" "$work/eo.out"
+if has_line '^start ' "$work/eo.out" && running "$esurvivor"; then fail "an ordinary run started beside a dead exclusive run's command"; fi
+wait "$peo" || fail "the ordinary run failed: $(cat "$work/eo.err")"
+pids=()
+before "$(finished "$esurvivor")" "$(field start "$work/eo.out")" || fail "the ordinary run started before the exclusive survivor ended"
+
+echo "== a survivor past its own timeout is stopped by the run that waits for it, and by nothing earlier"
+spawn "$project" "$repo" --worktree "${small[@]}" --timeout 12 -- bash -c "$timed" timed 300 >"$work/v.out" 2>"$work/v.err" & pv=$!
+pids=("$pv")
+wait_for 120 "the run's command to start" has_line '^start ' "$work/v.out"
+vrid="$(run_id_of "$work/v.err")"; overdue="$project-dev-run-$vrid"
+kill -KILL "$pv"
+wait "$pv" 2>/dev/null || true
+pids=()
+prun "$project" "$work/wt2" --worktree "${small[@]}" --exclusive -- bash -c "$timed" timed 1 >"$work/y.out" 2>"$work/y.err" ||
+  fail "the exclusive run failed: $(cat "$work/y.err")"
+grep -q "stopping $overdue: its runner is dead and its 12 s timeout has passed" "$work/y.err" ||
+  fail "the exclusive run did not stop the overdue survivor: $(cat "$work/y.err")"
+running "$overdue" && fail "the overdue survivor is still running"
+overdue_end="$(finished "$overdue")"
+lived="$(awk -v a="$(epoch "$overdue" StartedAt)" -v b="$overdue_end" 'BEGIN { printf "%.1f", b - a }')"
+before 12 "$lived" || fail "the survivor was stopped after $lived s, before its 12 s timeout"
+before 60 "$lived" && fail "the survivor lived $lived s: nothing stopped it at its 12 s timeout"
+before "$overdue_end" "$(field start "$work/y.out")" || fail "the exclusive run started before the survivor stopped"
+env DEVRUN_STATE_DIR="$private" "$devrun" --gc "$project" >"$work/gc4.out" || fail "gc failed: $(cat "$work/gc4.out")"
+for r in "$srid" "$erid" "$vrid"; do
+  [[ -z "$(leftovers_of "$r")" ]] || fail "gc left resources of dead run $r: $(leftovers_of "$r")"
+done
 
 echo "== --gc removes the target of a deleted worktree and never touches resources it cannot prove are leftovers"
 gone="$work/gone"; mkdir -p "$gone"; git -C "$gone" init -q -b main; printf 'x\n' > "$gone/x"
