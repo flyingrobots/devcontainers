@@ -3,33 +3,41 @@
 
 Rules: docs/hygiene.md (ULTRAMAX PARANOIA). The repository is copied in, never
 mounted. The tarball is checked and rewritten on the host before Docker sees it.
-Each run claims git-locks keys, uses fixed names and owner labels, and removes
-its container on every exit path.
+Each run has its own id, container, and copy and scratch volumes, labelled with
+the owner, the role, and the run id, and removes them on every exit path. Runs
+wait for one of a small number of command slots, not for a machine-wide lock
+(docs/hygiene.md section 10).
 
 Usage:
   devrun PROJECT REPO (--commit SHA | --history BASE..HEAD | --worktree)
          [--rust VERSION | --image IMAGE] [--fetch] [--network] [--evidence]
          [--export PATH]... [--export-patch] [--out DIR] [--timeout SECONDS]
-         [--cpus N] [--memory SIZE] -- COMMAND [ARG...]
+         [--cpus N] [--memory SIZE] [--max-runs N] [--exclusive] [--wait SECONDS]
+         -- COMMAND [ARG...]
+  devrun --gc PROJECT [--dry-run]
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
+import json
 import os
 import posixpath
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 UID = 10001
 GID = 10001
@@ -37,9 +45,20 @@ OWNER_LABEL = "org.flyingrobots.owner"
 ROLE_LABEL = "org.flyingrobots.role"
 PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+RUN_ID_LABEL = "org.flyingrobots.run-id"
+SOURCE_PATH_LABEL = "org.flyingrobots.source-path"
+SOURCE_KEY_LABEL = "org.flyingrobots.source-key"
+RUN_ID_RE = re.compile(r"[0-9a-f]{12}")
+SOURCE_KEY_RE = re.compile(r"[0-9a-f]{16}")
 LOCK_STORE = "/Users/Shared/git-locks/workstation.git"
-LOCK_ENV = "DEVRUN_LOCK_JOB"
 DEFAULT_RUST = "1.96.0"
+STATE_ENV = "DEVRUN_STATE_DIR"
+MAX_RUNS_ENV = "DEVRUN_MAX_RUNS"
+DEFAULT_MAX_RUNS = 4
+MAX_RUNS_LIMIT = 64
+DEFAULT_WAIT = 3600
+# Roles of the volumes that belong to one run and are removed by it (docs/hygiene.md section 5).
+PER_RUN_ROLES = ("work", "scratch", "target-evidence")
 
 
 class DevrunError(Exception):
@@ -337,6 +356,10 @@ if [ "$mode" = history ]; then
   test "$(git rev-parse HEAD)" = "$DEVRUN_HEAD" || { echo "devrun: clone HEAD does not match $DEVRUN_HEAD" >&2; exit 97; }
 else
   if find . -name .git -print -quit | grep -q .; then echo "devrun: .git found in the copy" >&2; exit 98; fi
+  # git archive gives every file the commit time, which can be older than build output that the
+  # shared iteration target already holds; cargo would then reuse that output (issue #9). Commit
+  # mode therefore gives the copy the current time. Worktree mode keeps the files' own times.
+  if [ "${DEVRUN_FRESH_MTIMES:-0}" = 1 ]; then find . -mindepth 1 -exec touch -h -- {} +; fi
   git_q init -q .
   git_q add -A
   git_q commit -q --allow-empty -m "devrun baseline"
@@ -353,8 +376,9 @@ fi
 exit "$status"
 '''
 
-# Empties the copy and scratch volumes completely, hidden entries included, so nothing one run
-# plants (such as a .cargo/config.toml) reaches the next (docs/hygiene.md section 2).
+# Empties the copy and scratch volumes completely, hidden entries included, so nothing the fetch
+# phase leaves (such as a .cargo/config.toml) reaches the command phase (docs/hygiene.md section 2).
+# The volumes belong to one run and start empty; emptying them again costs little.
 PREP_SCRIPT = r'''
 set -euo pipefail
 find /work /scratch -mindepth 1 -delete
@@ -367,30 +391,398 @@ if [ "$1" = 1 ]; then find /target -mindepth 1 -delete; fi
 FETCH_COMMAND = ["bash", "-c", 'mkdir -p "$HOME" "$TMPDIR" && exec cargo fetch --locked']
 
 
+# --------------------------------------------------------------------------- #
+# Names and labels (docs/hygiene.md section 5)
+# --------------------------------------------------------------------------- #
+
+
+def new_run_id() -> str:
+    """Twelve hex digits: unique enough for concurrent runs on one machine, short in names."""
+    return uuid.uuid4().hex[:12]
+
+
+def run_resource_names(project: str, run_id: str) -> Dict[str, str]:
+    """The names of the resources that belong to one run and that the run removes."""
+    return {"container": f"{project}-dev-run-{run_id}",
+            "work": f"{project}-work-{run_id}",
+            "scratch": f"{project}-scratch-{run_id}",
+            "target-evidence": f"{project}-target-evidence-{run_id}"}
+
+
+def source_key(top: str) -> str:
+    """A stable key for a source tree: the first 16 hex digits of SHA-256 over its real path."""
+    return hashlib.sha256(os.fsencode(top)).hexdigest()[:16]
+
+
+def target_volume_name(project: str, key: str) -> str:
+    """The iteration target of one source tree (one git worktree)."""
+    return f"{project}-target-{key}"
+
+
+def resource_labels(project: str, role: str, run_id: Optional[str] = None,
+                    extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    labels = {OWNER_LABEL: project, ROLE_LABEL: role}
+    if run_id is not None:
+        labels[RUN_ID_LABEL] = run_id
+    labels.update(extra or {})
+    return labels
+
+
+def label_args(labels: Dict[str, str]) -> List[str]:
+    args: List[str] = []
+    for k, v in labels.items():
+        args += ["--label", f"{k}={v}"]
+    return args
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency (docs/hygiene.md section 10)
+# --------------------------------------------------------------------------- #
+#
+# All coordination uses fcntl.flock on files in a per-user state directory. The kernel drops a
+# flock when its process exits, however it exits, so no crash leaves a stale lock behind. A lock
+# belongs to an open file description, so two opens in one process exclude each other like two
+# processes do (the unit tests rely on this, with threads).
+
+
+def state_dir(env: Optional[Dict[str, str]] = None) -> Path:
+    """The per-user directory for slot, fetch, and run-liveness lock files, created 0700."""
+    env = os.environ if env is None else env
+    raw = env.get(STATE_ENV)
+    if raw:
+        path = Path(raw)
+    else:
+        base = env.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        path = Path(base) / "devrun"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (path / "runs").mkdir(mode=0o700, exist_ok=True)
+    st = os.stat(path)
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise DevrunError(f"refused: state directory {path} is not owned by this user or is writable by others")
+    return path
+
+
+def _open_lock(path: Path, create: bool = True) -> int:
+    return os.open(str(path), os.O_RDWR | (os.O_CREAT if create else 0), 0o600)
+
+
+def _try_lock(fd: int, mode: int) -> bool:
+    try:
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+class Waiter:
+    """Polls with an injected clock and sleep, and reports how long it has waited.
+
+    Prints one line when the wait starts and one every `report_every` seconds after that.
+    Raises DevrunError once `limit` seconds have passed (None waits forever).
+    """
+
+    def __init__(self, what: str, limit: Optional[float], clock: Callable[[], float],
+                 sleep: Callable[[float], None], report: Callable[[str], None],
+                 poll: float, report_every: float):
+        self.what, self.limit, self.clock, self.sleep = what, limit, clock, sleep
+        self.report, self.poll, self.report_every = report, poll, report_every
+        self.start = clock()
+        self.next_report = self.start
+
+    def wait(self) -> None:
+        now = self.clock()
+        waited = now - self.start
+        if self.limit is not None and waited >= self.limit:
+            raise DevrunError(f"gave up after waiting {int(waited)} s for {self.what}")
+        if now >= self.next_report:
+            self.report(f"devrun: waiting for {self.what}; waited {int(waited)} s so far")
+            self.next_report = now + self.report_every
+        self.sleep(self.poll)
+
+
+def _report_stderr(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Admission:
+    """Held lock files; release() (or leaving the with block) closes them, which drops the locks."""
+
+    def __init__(self, fds: List[int]):
+        self.fds = fds
+
+    def release(self) -> None:
+        while self.fds:
+            os.close(self.fds.pop())
+
+    def __enter__(self) -> "Admission":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+class Gate:
+    """At most `max_runs` command phases at once; an exclusive run has the machine to itself.
+
+    Files in the state directory:
+      turnstile   an ordinary run passes it only for the instant of its own admission; an
+                  exclusive run holds it from the moment it starts waiting until it finishes,
+                  so once an exclusive run waits, no new ordinary run is admitted.
+      runs.lock   ordinary runs hold it shared, an exclusive run holds it exclusively, so the
+                  exclusive run starts only after every admitted ordinary run has finished.
+      slot-<i>    an ordinary run holds one of slot-0 .. slot-<max_runs - 1>.
+    An ordinary run takes the three in one attempt or none, and retries; it never holds the shared
+    lock while it waits for a slot, so it cannot delay an exclusive run that is already waiting.
+    """
+
+    def __init__(self, directory: Path, max_runs: int, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep, report: Callable[[str], None] = _report_stderr,
+                 poll: float = 0.5, report_every: float = 30.0):
+        if not 1 <= max_runs <= MAX_RUNS_LIMIT:
+            raise DevrunError(f"the run cap must be between 1 and {MAX_RUNS_LIMIT}")
+        self.directory, self.max_runs = directory, max_runs
+        self.clock, self.sleep, self.report = clock, sleep, report
+        self.poll, self.report_every = poll, report_every
+
+    def waiter(self, what: str, limit: Optional[float], poll: Optional[float] = None) -> Waiter:
+        return Waiter(what, limit, self.clock, self.sleep, self.report, poll or self.poll, self.report_every)
+
+    def admit(self, exclusive: bool, limit: Optional[float]) -> Admission:
+        opened: List[int] = []
+        try:
+            turnstile = _open_lock(self.directory / "turnstile")
+            opened.append(turnstile)
+            shared = _open_lock(self.directory / "runs.lock")
+            opened.append(shared)
+            if exclusive:
+                return self._admit_exclusive(turnstile, shared, opened, limit)
+            return self._admit_ordinary(turnstile, shared, opened, limit)
+        except BaseException:
+            for fd in opened:
+                os.close(fd)
+            raise
+
+    def _admit_exclusive(self, turnstile: int, shared: int, opened: List[int], limit: Optional[float]) -> Admission:
+        w = self.waiter("exclusive access (another exclusive run is queued or running)", limit)
+        while not _try_lock(turnstile, fcntl.LOCK_EX):
+            w.wait()
+        w.what = "exclusive access (ordinary runs are finishing; new ones wait behind this run)"
+        while not _try_lock(shared, fcntl.LOCK_EX):
+            w.wait()
+        return Admission(opened)
+
+    def _admit_ordinary(self, turnstile: int, shared: int, opened: List[int], limit: Optional[float]) -> Admission:
+        slots = []
+        for i in range(self.max_runs):
+            slots.append(_open_lock(self.directory / f"slot-{i}"))
+            opened.append(slots[-1])
+        w = self.waiter(f"a run slot (at most {self.max_runs} at once, or an exclusive run is queued)", limit)
+        while True:
+            got = None
+            if _try_lock(turnstile, fcntl.LOCK_EX):
+                try:
+                    if _try_lock(shared, fcntl.LOCK_SH):
+                        got = next((fd for fd in slots if _try_lock(fd, fcntl.LOCK_EX)), None)
+                        if got is None:
+                            fcntl.flock(shared, fcntl.LOCK_UN)
+                finally:
+                    fcntl.flock(turnstile, fcntl.LOCK_UN)
+            if got is not None:
+                keep = [shared, got]
+                for fd in opened:
+                    if fd not in keep:
+                        os.close(fd)
+                opened[:] = keep
+                return Admission(list(keep))
+            w.wait()
+
+    def hold(self, name: str, what: str, limit: Optional[float]) -> Admission:
+        """An exclusive lock on one named file, such as a project's fetch lock."""
+        fd = _open_lock(self.directory / name)
+        try:
+            w = self.waiter(what, limit)
+            while not _try_lock(fd, fcntl.LOCK_EX):
+                w.wait()
+        except BaseException:
+            os.close(fd)
+            raise
+        return Admission([fd])
+
+
+class RunRecord:
+    """The run's liveness lock: runs/<run-id>.lock, locked for as long as the run lives.
+
+    The run locks it before it creates any Docker resource and removes it only after all of them
+    are gone. `--gc` treats a run as dead only when it can lock this file itself, which is proof
+    that the process holding it has exited (the kernel drops a flock on any exit, SIGKILL
+    included). Process ids can be reused and an age proves nothing, so neither is used.
+    """
+
+    def __init__(self, directory: Path, run_id: str, facts: Dict[str, str]):
+        self.path = directory / "runs" / f"{run_id}.lock"
+        try:
+            self.fd: Optional[int] = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise DevrunError(f"refused: run record {self.path} already exists (run id collision)")
+        if not _try_lock(self.fd, fcntl.LOCK_EX):
+            raise DevrunError(f"could not lock the new run record {self.path}")
+        os.write(self.fd, json.dumps(facts, sort_keys=True).encode())
+
+    def finish(self, clean: bool) -> None:
+        """Drop the lock. The file is removed only when every resource of the run is gone, so a
+        run that could not clean up stays visible to --gc as dead."""
+        if self.fd is None:
+            return
+        if clean:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        os.close(self.fd)
+        self.fd = None
+
+
+def run_liveness(directory: Path, run_id: str) -> str:
+    """'alive', 'dead', or 'unknown' for a run id, read from its liveness lock without waiting."""
+    path = directory / "runs" / f"{run_id}.lock"
+    try:
+        fd = _open_lock(path, create=False)
+    except FileNotFoundError:
+        return "unknown"
+    try:
+        if not _try_lock(fd, fcntl.LOCK_EX):
+            return "alive"
+        held = os.fstat(fd)
+        try:
+            now = os.stat(str(path))
+        except FileNotFoundError:
+            return "unknown"  # the run finished and removed its record meanwhile
+        return "dead" if (held.st_dev, held.st_ino) == (now.st_dev, now.st_ino) else "unknown"
+    finally:
+        os.close(fd)
+
+
+def live_run_facts(directory: Path) -> Optional[List[dict]]:
+    """The facts of every live run, or None when a live run's record cannot be read."""
+    facts = []
+    for entry in sorted((directory / "runs").glob("*.lock")):
+        run_id = entry.name[:-len(".lock")]
+        if not RUN_ID_RE.fullmatch(run_id) or run_liveness(directory, run_id) != "alive":
+            continue
+        try:
+            facts.append(json_loads(entry.read_text()))
+        except (OSError, ValueError):
+            return None
+    return facts
+
+
+# --------------------------------------------------------------------------- #
+# git-locks visibility (docs/hygiene.md section 10)
+# --------------------------------------------------------------------------- #
+
+
+class Lease:
+    """Registers the run's container under host/docker/<container>/ in the workstation store.
+
+    The key is unique, so it never conflicts with another run. It keeps the workstation registry
+    accurate and keeps daemon-wide maintenance (which claims host/docker/) out while runs are
+    active. A missing or broken git-locks only prints one line: it never stops a run. A refusal
+    (exit 1) means a holder of host/docker/; the run waits for it like for a slot.
+    """
+
+    def __init__(self, job: str, holder: str, key: str, ttl: int, note: str,
+                 executable: Optional[str] = None, env: Optional[Dict[str, str]] = None):
+        self.job, self.holder, self.key, self.ttl, self.note = job, holder, key, ttl, note
+        self.executable = executable if executable is not None else shutil.which("git-locks")
+        base = dict(os.environ if env is None else env)
+        base.setdefault("GIT_LOCKS_STORE", LOCK_STORE)
+        self.env = base
+        self.held = False
+
+    def _call(self, args: List[str]) -> Optional[int]:
+        try:
+            p = run([self.executable, *args], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"devrun: git-locks failed ({exc}); continuing without registration", file=sys.stderr)
+            return None
+        return p.returncode
+
+    def claim(self, waiter: Waiter) -> bool:
+        if not self.executable:
+            print("devrun: git-locks not found; the run is not registered in the lock store", file=sys.stderr)
+            return False
+        while True:
+            code = self._call(["claim", "--job", self.job, "--holder", self.holder, "--ttl", str(self.ttl),
+                               "--note", self.note, self.key])
+            if code == 0:
+                self.held = True
+                return True
+            if code != 1:
+                if code is not None:
+                    print(f"devrun: git-locks claim exited {code}; continuing without registration", file=sys.stderr)
+                return False
+            waiter.wait()
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            self._call(["release", "--job", self.job])
+
+
+# --------------------------------------------------------------------------- #
+# Containers (docs/hygiene.md sections 2, 3, 5, 7)
+# --------------------------------------------------------------------------- #
+
+
 class Docker:
-    def __init__(self, project: str, image: str, cpus: str, memory: str, network_default: bool):
+    def __init__(self, project: str, run_id: str, image: str, cpus: str, memory: str):
         self.project = project
+        self.run_id = run_id
         self.image = image
         self.cpus = cpus
         self.memory = memory
-        self.name = f"{project}-dev-run"
+        self.names = run_resource_names(project, run_id)
+        self.name = self.names["container"]
         # True only between a successful `docker create` by this run and its removal, so cleanup
-        # never touches a container that another run (or litter) owns under the same name.
+        # never touches a container that this run did not create.
         self.created = False
+        # Per-run volumes this run created and has not removed yet; cleanup removes only these.
+        self.volumes: List[str] = []
 
     def labels(self, role: str) -> List[str]:
-        return ["--label", f"{OWNER_LABEL}={self.project}", "--label", f"{ROLE_LABEL}={role}"]
+        return label_args(resource_labels(self.project, role, self.run_id))
 
-    def ensure_volume(self, name: str, role: str) -> None:
+    def _volume_labels(self, name: str) -> Optional[dict]:
         p = run(["docker", "volume", "inspect", name, "--format", "{{json .Labels}}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if p.returncode == 0:
-            labels = json_loads(p.stdout.decode() or "null") or {}
-            if labels.get(OWNER_LABEL) != self.project:
-                raise DevrunError(f"refused: volume {name} exists but is not owned by {self.project}")
-            return
+        if p.returncode != 0:
+            return None
+        return json_loads(p.stdout.decode() or "null") or {}
+
+    def ensure_volume(self, name: str, role: str, extra: Optional[Dict[str, str]] = None) -> None:
+        """Create a shared volume, or check that the existing one is ours (and, for a target, that
+        it is the target of this source tree). Two runs may create it at the same moment: the
+        labels are checked again after the create."""
+        want = resource_labels(self.project, role, None, extra)
+        labels = self._volume_labels(name)
+        if labels is None:
+            p = run(["docker", "volume", "create", *label_args(want), name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode != 0:
+                raise DevrunError(f"docker volume create {name} failed: {p.stderr.decode(errors='replace').strip()}")
+            labels = self._volume_labels(name) or {}
+        for k, v in want.items():
+            if labels.get(k) != v:
+                raise DevrunError(f"refused: volume {name} exists but its label {k} is not {v!r}")
+
+    def create_run_volume(self, role: str) -> str:
+        """Create one of this run's own volumes. It must not exist yet."""
+        name = self.names[role]
+        if self._volume_labels(name) is not None:
+            raise DevrunError(f"refused: volume {name} already exists (run id collision, or litter)")
         p = run(["docker", "volume", "create", *self.labels(role), name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise DevrunError(f"docker volume create {name} failed: {p.stderr.decode(errors='replace').strip()}")
+        self.volumes.append(name)
+        return name
 
     def create(self, cmd: List[str], network: bool, target_volume: str, env: Optional[dict] = None,
                caches_writable: bool = False) -> None:
@@ -406,8 +798,8 @@ class Docker:
                 "--mount", f"type=volume,src={self.project}-cargo-registry,dst=/usr/local/cargo/registry{ro}",
                 "--mount", f"type=volume,src={self.project}-cargo-git,dst=/usr/local/cargo/git{ro}",
                 "--mount", f"type=volume,src={target_volume},dst=/target",
-                "--mount", f"type=volume,src={self.project}-work,dst=/work",
-                "--mount", f"type=volume,src={self.project}-scratch,dst=/scratch",
+                "--mount", f"type=volume,src={self.names['work']},dst=/work",
+                "--mount", f"type=volume,src={self.names['scratch']},dst=/scratch",
                 "--env", "HOME=/tmp/home",
                 # Docker mounts --tmpfs noexec by default, so test binaries (rustdoc's doctests)
                 # cannot run from /tmp. TMPDIR is a separate tmpfs that allows execution, capped at
@@ -453,8 +845,20 @@ class Docker:
         """Remove the run container, only if this run created it."""
         if not self.created:
             return
-        run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.created = False
+        p = run(["docker", "rm", "-f", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if p.returncode == 0:
+            self.created = False
+
+    def cleanup(self) -> bool:
+        """Remove this run's container and volumes. True when nothing this run created is left."""
+        self.remove()
+        for name in list(self.volumes):
+            p = run(["docker", "volume", "rm", name], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if p.returncode == 0:
+                self.volumes.remove(name)
+            else:
+                print(f"devrun: could not remove volume {name}: {p.stderr.decode(errors='replace').strip()}", file=sys.stderr)
+        return not self.created and not self.volumes
 
     def exists(self) -> bool:
         p = run(["docker", "ps", "-a", "--filter", f"name=^{self.name}$", "--format", "{{.Names}}"], stdout=subprocess.PIPE)
@@ -462,13 +866,183 @@ class Docker:
 
 
 def json_loads(text: str):
-    import json
     return json.loads(text)
+
+
+# --------------------------------------------------------------------------- #
+# Leftovers of dead runs and deleted worktrees: devrun --gc PROJECT
+# --------------------------------------------------------------------------- #
+
+
+def plan_gc(project: str, containers: List[dict], volumes: List[dict], liveness: Callable[[str], str],
+            path_exists: Callable[[str], bool], protected_keys: Optional[Set[str]]) -> dict:
+    """Choose what --gc removes. Pure: the inventory and the checks come in as arguments.
+
+    containers: every container on the daemon, as {"name", "running", "labels", "mounts"}.
+    volumes: the volumes labelled with this project's owner label, as {"name", "labels"}.
+    liveness(run_id) -> 'alive' | 'dead' | 'unknown'; only 'dead' allows removal.
+    protected_keys: source keys of live runs' targets, or None when that is unknown (then no
+    target volume is removed).
+    Selected: stopped containers and per-run volumes of dead runs, and target volumes whose source
+    path no longer exists. Never selected: anything without this project's owner label, anything
+    whose name does not match its labels, anything attached to a running container or to a
+    container that is not itself selected, the cargo caches, and legacy fixed-name volumes.
+    """
+    remove_containers: List[str] = []
+    remove_volumes: List[str] = []
+    kept: List[tuple] = []
+    attached: Dict[str, List[dict]] = {}
+    for c in containers:
+        for m in c.get("mounts") or []:
+            attached.setdefault(m, []).append(c)
+
+    for c in containers:
+        labels = c.get("labels") or {}
+        if labels.get(OWNER_LABEL) != project or labels.get(ROLE_LABEL) != "dev-run":
+            continue
+        rid = labels.get(RUN_ID_LABEL) or ""
+        if not RUN_ID_RE.fullmatch(rid) or c["name"] != run_resource_names(project, rid)["container"]:
+            kept.append((c["name"], "no valid run id label (legacy or foreign); not touched"))
+            continue
+        state = liveness(rid)
+        if state != "dead":
+            kept.append((c["name"], f"run {rid} is {state}"))
+        elif c.get("running"):
+            kept.append((c["name"], f"run {rid} is dead but its container is still running; "
+                                    f"stop it with docker stop {c['name']} and run --gc again"))
+        else:
+            remove_containers.append(c["name"])
+
+    def attachments_ok(name: str) -> Optional[str]:
+        for c in attached.get(name, []):
+            if c.get("running"):
+                return f"attached to running container {c['name']}"
+            if c["name"] not in remove_containers:
+                return f"attached to container {c['name']}, which is not being removed"
+        return None
+
+    for v in volumes:
+        name, labels = v["name"], v.get("labels") or {}
+        if labels.get(OWNER_LABEL) != project:
+            continue
+        role = labels.get(ROLE_LABEL)
+        if role in PER_RUN_ROLES:
+            rid = labels.get(RUN_ID_LABEL) or ""
+            if not RUN_ID_RE.fullmatch(rid) or name != run_resource_names(project, rid)[role]:
+                kept.append((name, "no valid run id label (legacy fixed-name volume); not touched"))
+                continue
+            state = liveness(rid)
+            if state != "dead":
+                kept.append((name, f"run {rid} is {state}"))
+                continue
+            problem = attachments_ok(name)
+            if problem:
+                kept.append((name, problem))
+            else:
+                remove_volumes.append(name)
+        elif role == "target":
+            path, key = labels.get(SOURCE_PATH_LABEL), labels.get(SOURCE_KEY_LABEL) or ""
+            if not path:
+                kept.append((name, "no source path label (legacy per-project target); not touched"))
+                continue
+            if not SOURCE_KEY_RE.fullmatch(key) or key != source_key(path) or name != target_volume_name(project, key):
+                kept.append((name, "its name and source labels do not match; not touched"))
+                continue
+            if path_exists(path):
+                kept.append((name, f"worktree {path} exists"))
+                continue
+            if protected_keys is None or key in protected_keys:
+                kept.append((name, "a live run may be using it"))
+                continue
+            problem = attachments_ok(name)
+            if problem:
+                kept.append((name, problem))
+            else:
+                remove_volumes.append(name)
+    return {"containers": remove_containers, "volumes": remove_volumes, "kept": kept}
+
+
+def _inspect(kind: List[str], names: List[str]) -> List[dict]:
+    if not names:
+        return []
+    p = run(["docker", *kind, "inspect", *names], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # A resource removed between the listing and the inspect makes the inspect exit 1 but still
+    # prints the others.
+    return json_loads(p.stdout.decode() or "[]") if p.stdout.strip() else []
+
+
+def docker_inventory(project: str) -> tuple:
+    p = run(["docker", "ps", "-aq", "--no-trunc"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"docker ps failed: {p.stderr.decode(errors='replace').strip()}")
+    containers = [{"name": d["Name"].lstrip("/"), "running": bool(d["State"]["Running"]),
+                   "labels": d["Config"].get("Labels") or {},
+                   "mounts": [m.get("Name") for m in d.get("Mounts") or [] if m.get("Type") == "volume"]}
+                  for d in _inspect(["container"], p.stdout.decode().split())]
+    p = run(["docker", "volume", "ls", "-q", "--filter", f"label={OWNER_LABEL}={project}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise DevrunError(f"docker volume ls failed: {p.stderr.decode(errors='replace').strip()}")
+    volumes = [{"name": d["Name"], "labels": d.get("Labels") or {}} for d in _inspect(["volume"], p.stdout.decode().split())]
+    return containers, volumes
+
+
+def gc_main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(prog="devrun --gc", description="Remove leftovers of dead runs and targets of deleted worktrees.")
+    ap.add_argument("project")
+    ap.add_argument("--dry-run", action="store_true", help="list what would be removed, remove nothing")
+    ns = ap.parse_args(argv)
+    if not PROJECT_RE.fullmatch(ns.project):
+        raise DevrunError(f"invalid project name {ns.project!r} (lowercase letters, digits, hyphens)")
+    directory = state_dir()
+    live = live_run_facts(directory)
+    protected = None if live is None else {f.get("source_key") for f in live if f.get("project") == ns.project}
+    containers, volumes = docker_inventory(ns.project)
+    plan = plan_gc(ns.project, containers, volumes, lambda rid: run_liveness(directory, rid), os.path.isdir, protected)
+    verb = "would remove" if ns.dry_run else "remove"
+    failed = False
+    for name, reason in plan["kept"]:
+        print(f"devrun gc: keep {name}: {reason}")
+    for name in plan["containers"]:
+        print(f"devrun gc: {verb} container {name}")
+        # No -f: Docker itself refuses to remove a container that started running meanwhile.
+        if not ns.dry_run and run(["docker", "rm", name], stdout=subprocess.DEVNULL).returncode != 0:
+            failed = True
+    for name in plan["volumes"]:
+        print(f"devrun gc: {verb} volume {name}")
+        # Docker refuses to remove a volume that any container uses.
+        if not ns.dry_run and run(["docker", "volume", "rm", name], stdout=subprocess.DEVNULL).returncode != 0:
+            failed = True
+    if not ns.dry_run:
+        # Forget dead runs that have nothing left.
+        left_containers, left_volumes = docker_inventory(ns.project)
+        left_ids = {(r.get("labels") or {}).get(RUN_ID_LABEL) for r in left_containers + left_volumes}
+        for entry in (directory / "runs").glob("*.lock"):
+            rid = entry.name[:-len(".lock")]
+            if RUN_ID_RE.fullmatch(rid) and rid not in left_ids and run_liveness(directory, rid) == "dead":
+                facts = {}
+                try:
+                    facts = json_loads(entry.read_text())
+                except (OSError, ValueError):
+                    pass
+                if facts.get("project") == ns.project:
+                    entry.unlink()
+    if not plan["containers"] and not plan["volumes"]:
+        print(f"devrun gc: nothing to remove for {ns.project}")
+    return 1 if failed else 0
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+
+
+def _max_runs_default() -> int:
+    raw = os.environ.get(MAX_RUNS_ENV)
+    if raw is None or raw == "":
+        return DEFAULT_MAX_RUNS
+    if not raw.isdigit():
+        raise DevrunError(f"{MAX_RUNS_ENV} must be a whole number, not {raw!r}")
+    return int(raw)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -490,18 +1064,29 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     img.add_argument("--image")
     ap.add_argument("--fetch", action="store_true", help="run cargo fetch --locked with network first")
     ap.add_argument("--network", action="store_true", help="give the command itself network access")
-    ap.add_argument("--evidence", action="store_true", help="use an emptied evidence target volume")
+    ap.add_argument("--evidence", action="store_true", help="build into this run's own empty target volume")
     ap.add_argument("--export", action="append", default=[], metavar="PATH")
     ap.add_argument("--export-patch", action="store_true")
     ap.add_argument("--out", metavar="DIR")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--cpus", default="4")
     ap.add_argument("--memory", default="8g")
+    ap.add_argument("--max-runs", type=int, default=None, metavar="N",
+                    help=f"at most N command phases at once (default ${MAX_RUNS_ENV} or {DEFAULT_MAX_RUNS})")
+    ap.add_argument("--exclusive", action="store_true", help="run the command phase alone on the machine (benchmarks)")
+    ap.add_argument("--wait", type=int, default=DEFAULT_WAIT, metavar="SECONDS",
+                    help="give up after waiting this long for a slot or a lock")
     ns = ap.parse_args(head)
     if not PROJECT_RE.fullmatch(ns.project):
         raise DevrunError(f"invalid project name {ns.project!r} (lowercase letters, digits, hyphens)")
     if ns.timeout <= 0 or ns.timeout > 7200:
         raise DevrunError("--timeout must be between 1 and 7200 seconds")
+    if ns.wait < 0 or ns.wait > 86400:
+        raise DevrunError("--wait must be between 0 and 86400 seconds")
+    if ns.max_runs is None:
+        ns.max_runs = _max_runs_default()
+    if not 1 <= ns.max_runs <= MAX_RUNS_LIMIT:
+        raise DevrunError(f"the run cap (--max-runs or {MAX_RUNS_ENV}) must be between 1 and {MAX_RUNS_LIMIT}")
     for e in ns.export:
         _safe_member_path(e)
     ns.command = command
@@ -548,21 +1133,34 @@ def copy_in(docker: "Docker", target_volume: str, tar_path: Path, dest: str, env
 
 def main_inner(ns: argparse.Namespace) -> int:
     repo = Path(ns.repo).resolve()
-    top = Path(git(repo, "rev-parse", "--show-toplevel"))
+    top = Path(os.path.realpath(git(repo, "rev-parse", "--show-toplevel")))
+    key = source_key(str(top))
     out = fresh_out_dir(ns.out)
-    work = Path(tempfile.mkdtemp(prefix="devrun-src-"))
     image = ns.image or f"flyingrobots/rust-dev:{ns.rust}"
-    docker = Docker(ns.project, image, ns.cpus, ns.memory, ns.network)
-    target_volume = f"{ns.project}-target-evidence" if ns.evidence else f"{ns.project}-target"
-    stop = {"flag": False}
+    run_id = new_run_id()
+    docker = Docker(ns.project, run_id, image, ns.cpus, ns.memory)
+    # CI machines run one job at a time and have no lock store: no slots and no registration there.
+    coordinated = os.environ.get("CI") != "true"
+    directory = state_dir()
+    gate = Gate(directory, ns.max_runs)
+    record = RunRecord(directory, run_id, {"project": ns.project, "source_key": key, "pid": str(os.getpid())})
+    lease = Lease(f"devrun-{ns.project}-{run_id}", f"devrun-{run_id}", f"host/docker/{docker.name}/",
+                  2 * ns.timeout + 2 * ns.wait + 1500, f"devrun {ns.project} run {run_id}")
+    work = Path(tempfile.mkdtemp(prefix="devrun-src-"))
+    print(f"devrun: run {run_id}, container {docker.name}", file=sys.stderr, flush=True)
 
     def on_signal(signum, _frame):
-        docker.remove()
-        raise DevrunError(f"interrupted by signal {signum}; container removed")
+        # Cleanup below must finish: a second signal is ignored rather than cutting it short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise DevrunError(f"interrupted by signal {signum}; removing this run's container and volumes")
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    clean = False
     try:
+        if coordinated:
+            lease.claim(gate.waiter("host/docker/ in the lock store (daemon maintenance?)", ns.wait, poll=2.0))
         if ns.history:
             facts = build_history(top, ns.history, work)
             tar_path, mode = work / "history.tar", "history"
@@ -572,12 +1170,16 @@ def main_inner(ns: argparse.Namespace) -> int:
             facts = build_source_tar(top, mode, ns.commit, tar_path)
         print(f"devrun: source {mode} {facts.get('sha') or '(unpinned worktree)'} {facts['tar_sha256']}", file=sys.stderr)
         if docker.exists():
-            raise DevrunError(f"refused: container {docker.name} already exists (another run, or litter)")
+            raise DevrunError(f"refused: container {docker.name} already exists (run id collision, or litter)")
         docker.ensure_volume(f"{ns.project}-cargo-registry", "cargo-registry")
         docker.ensure_volume(f"{ns.project}-cargo-git", "cargo-git")
-        docker.ensure_volume(target_volume, "target-evidence" if ns.evidence else "target")
-        docker.ensure_volume(f"{ns.project}-work", "work")
-        docker.ensure_volume(f"{ns.project}-scratch", "scratch")
+        if ns.evidence:
+            target_volume = docker.create_run_volume("target-evidence")
+        else:
+            target_volume = target_volume_name(ns.project, key)
+            docker.ensure_volume(target_volume, "target", {SOURCE_PATH_LABEL: str(top), SOURCE_KEY_LABEL: key})
+        docker.create_run_volume("work")
+        docker.create_run_volume("scratch")
         env = {"DEVRUN_HEAD": facts.get("sha") or "", "DEVRUN_BASE": facts.get("base") or ""}
         dest = "/scratch/in" if mode == "history" else "/work"
         if ns.fetch:
@@ -589,7 +1191,15 @@ def main_inner(ns: argparse.Namespace) -> int:
             prepare(docker, target_volume, ns.evidence)
             copy_in(docker, target_volume, fetch_tar, "/work", env)
             docker.create(FETCH_COMMAND, True, target_volume, fetch_environment(env, ns.rust), caches_writable=True)
-            if docker.start(ns.timeout) != 0:
+            # Cargo's own package-cache lock is $CARGO_HOME/.package-cache, on the read-only root:
+            # cargo warns that it cannot open it and fetches without any lock. Two fetches into the
+            # project's shared caches would then write the same files at once, so fetch phases of
+            # one project take turns on a host file lock (docs/hygiene.md section 10).
+            fetch_lock = (gate.hold(f"fetch-{ns.project}.lock", f"the {ns.project} fetch lock (another run is fetching)", ns.wait)
+                          if coordinated else Admission([]))
+            with fetch_lock:
+                fetched = docker.start(ns.timeout)
+            if fetched != 0:
                 raise DevrunError("cargo fetch --locked failed")
             docker.remove()
         # Phase 2 starts from empty volumes and a fresh copy, whatever phase 1 left behind.
@@ -598,8 +1208,11 @@ def main_inner(ns: argparse.Namespace) -> int:
         # Phase 2: the command, offline unless --network.
         cmd = ["bash", "-c", INNER_SCRIPT, "run", mode, "1" if ns.export_patch else "0", *ns.command]
         env["CARGO_NET_OFFLINE"] = "false" if ns.network else "true"
+        env["DEVRUN_FRESH_MTIMES"] = "1" if mode == "commit" else "0"
         docker.create(cmd, ns.network, target_volume, env)
-        status = docker.start(ns.timeout)
+        admission = gate.admit(ns.exclusive, ns.wait) if coordinated else Admission([])
+        with admission:
+            status = docker.start(ns.timeout)
         exported: List[str] = []
         for path in ns.export:
             exported += docker.export(path, out)
@@ -611,7 +1224,11 @@ def main_inner(ns: argparse.Namespace) -> int:
         print(f"devrun: exit {status}; exports in {out}: {', '.join(exported) or 'none'}", file=sys.stderr)
         return status
     finally:
-        docker.remove()
+        clean = docker.cleanup()
+        lease.release()
+        record.finish(clean)
+        if not clean:
+            print(f"devrun: run {run_id} left resources behind; remove them with: devrun --gc {ns.project}", file=sys.stderr)
         for p in work.glob("*"):
             p.unlink()
         work.rmdir()
@@ -619,16 +1236,9 @@ def main_inner(ns: argparse.Namespace) -> int:
 
 def main(argv: List[str]) -> int:
     try:
-        ns = parse_args(argv)
-        if os.environ.get("CI") == "true" or os.environ.get(LOCK_ENV):
-            return main_inner(ns)
-        job = f"devrun-{ns.project}-{uuid.uuid4()}"
-        lock = ["git", "locks", "with", "--job", job, "--holder", f"devrun-{os.getpid()}",
-                "--ttl", str(ns.timeout + 900), "--wait", "600", "--note", f"devrun {ns.project}",
-                "host/heavy-work", f"host/docker/{ns.project}-dev-run/", "--",
-                sys.executable, os.path.abspath(__file__), *argv]
-        env = dict(os.environ, GIT_LOCKS_STORE=os.environ.get("GIT_LOCKS_STORE", LOCK_STORE), **{LOCK_ENV: job})
-        return subprocess.call(lock, env=env)
+        if argv[:1] == ["--gc"]:
+            return gc_main(argv[1:])
+        return main_inner(parse_args(argv))
     except DevrunError as exc:
         print(f"devrun: {exc}", file=sys.stderr)
         return 2
